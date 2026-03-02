@@ -1,4 +1,4 @@
-module github.com/ImJustRicky/muster-fleet-cloud
+module github.com/Muster-dev/muster-fleet-cloud
 
 go 1.24.0
 

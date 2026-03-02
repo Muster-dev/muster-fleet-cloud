@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/agent"
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/config"
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/crypto"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/agent"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/config"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/crypto"
 )
 
 var version = "0.1.0"

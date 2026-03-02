@@ -79,6 +79,9 @@ func backoff(attempt int, cfg ReconnectConfig) time.Duration {
 		delay = float64(cfg.MaxDelay)
 	}
 
-	jitter := time.Duration(rand.Int63n(int64(cfg.MaxJitter)))
+	var jitter time.Duration
+	if cfg.MaxJitter > 0 {
+		jitter = time.Duration(rand.Int63n(int64(cfg.MaxJitter)))
+	}
 	return time.Duration(delay) + jitter
 }

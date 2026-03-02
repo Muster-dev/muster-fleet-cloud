@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/protocol"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
 )
 
 // Client manages a WebSocket connection to the relay.

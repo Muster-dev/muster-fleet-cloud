@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/protocol"
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/tunnel"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
 )
 
 var version = "0.1.0"

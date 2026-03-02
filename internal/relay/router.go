@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/tunnel"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
 )
 
 // Conn wraps a WebSocket connection with metadata.

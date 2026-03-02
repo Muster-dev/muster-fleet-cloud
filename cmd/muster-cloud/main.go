@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/relay"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/relay"
 )
 
 var version = "0.1.0"

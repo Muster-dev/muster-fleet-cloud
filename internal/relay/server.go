@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/protocol"
-	"github.com/ImJustRicky/muster-fleet-cloud/internal/tunnel"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
 )
 
 // Server is the muster-cloud relay server.
