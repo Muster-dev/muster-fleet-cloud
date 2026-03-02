@@ -27,6 +27,7 @@ type testEnv struct {
 
 	agentToken string // raw agent token
 	cliToken   string // raw CLI token
+	adminToken string // raw admin token
 	orgID      string
 }
 
@@ -62,6 +63,15 @@ func setupTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("store cli token: %v", err)
 	}
 
+	// Create an admin token
+	adminRaw, adminHash, err := auth.GenerateToken(auth.PrefixAdmin)
+	if err != nil {
+		t.Fatalf("generate admin token: %v", err)
+	}
+	if _, err := store.CreateToken(adminHash, auth.TypeAdmin, orgID, "admin-token"); err != nil {
+		t.Fatalf("store admin token: %v", err)
+	}
+
 	// Create relay server
 	srv := relay.NewServer(store)
 	ts := httptest.NewServer(srv.Handler())
@@ -73,6 +83,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 		storePath:  storePath,
 		agentToken: agentRaw,
 		cliToken:   cliRaw,
+		adminToken: adminRaw,
 		orgID:      orgID,
 	}
 }
@@ -779,7 +790,12 @@ func TestSmoke_AgentListHTTPEndpoint(t *testing.T) {
 	agent := env.connectAgent(t, "http-agent")
 	defer agent.Close()
 
-	resp, err := http.Get(env.server.URL + "/api/v1/agents?org_id=" + env.orgID)
+	req, err := http.NewRequest("GET", env.server.URL+"/api/v1/agents?org_id="+env.orgID, nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+env.adminToken)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /api/v1/agents: %v", err)
 	}

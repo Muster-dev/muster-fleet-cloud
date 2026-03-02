@@ -35,7 +35,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/tunnel", tunnel.AcceptHandler(s.handleTunnel))
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/api/v1/agents", s.handleListAgents)
+
+	// Admin-authenticated REST API
+	mux.HandleFunc("POST /api/v1/tokens", s.adminAuth(s.handleCreateToken))
+	mux.HandleFunc("GET /api/v1/tokens", s.adminAuth(s.handleListTokens))
+	mux.HandleFunc("DELETE /api/v1/tokens/{id}", s.adminAuth(s.handleDeleteToken))
+	mux.HandleFunc("GET /api/v1/agents", s.adminAuth(s.handleListAgents))
+
 	return mux
 }
 
@@ -49,14 +55,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	// TODO: auth middleware
 	orgID := r.URL.Query().Get("org_id")
 	agents := s.router.ListAgents(orgID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"agents": agents,
-	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"agents": agents})
 }
 
 func (s *Server) handleTunnel(ws *tunnel.WSConn) {
