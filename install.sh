@@ -25,14 +25,14 @@ while [ $# -gt 0 ]; do
       info "  --relay     Install muster-cloud relay server"
       info "  --all       Install agent + tunnel (default)"
       info "  --version   Pin to a specific version (default: latest)"
-      info "  --prefix    Install directory (default: ~/.muster/bin)"; exit 0 ;;
+      info "  --prefix    Install directory (default: ~/.local/bin)"; exit 0 ;;
     *) die "Unknown flag: $1" ;;
   esac
 done
 if [ "$INSTALL_AGENT" -eq 0 ] && [ "$INSTALL_TUNNEL" -eq 0 ] && [ "$INSTALL_RELAY" -eq 0 ]; then
   INSTALL_AGENT=1; INSTALL_TUNNEL=1
 fi
-PREFIX="${PREFIX:-${HOME}/.muster/bin}"
+PREFIX="${PREFIX:-${HOME}/.local/bin}"
 
 # --- detect platform -------------------------------------------------------
 case "$(uname -s)" in
