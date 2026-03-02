@@ -9,25 +9,27 @@ BASE_URL="https://github.com/${REPO}/releases/download"
 die() { printf '%b\n' "Error: $1" >&2; exit 1; }
 info() { printf '%b\n' "$1"; }
 
-VERSION=""; PREFIX=""; INSTALL_AGENT=0; INSTALL_TUNNEL=0
+VERSION=""; PREFIX=""; INSTALL_AGENT=0; INSTALL_TUNNEL=0; INSTALL_RELAY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --agent)   INSTALL_AGENT=1; shift ;;
     --tunnel)  INSTALL_TUNNEL=1; shift ;;
+    --relay)   INSTALL_RELAY=1; shift ;;
     --all)     INSTALL_AGENT=1; INSTALL_TUNNEL=1; shift ;;
     --version) VERSION="$2"; shift 2 ;;
     --prefix)  PREFIX="$2"; shift 2 ;;
     -h|--help)
-      info "Usage: install.sh [--agent] [--tunnel] [--all] [--version VER] [--prefix DIR]"
+      info "Usage: install.sh [--agent] [--tunnel] [--relay] [--all] [--version VER] [--prefix DIR]"
       info ""; info "  --agent     Install muster-agent only"
       info "  --tunnel    Install muster-tunnel only"
+      info "  --relay     Install muster-cloud relay server"
       info "  --all       Install agent + tunnel (default)"
       info "  --version   Pin to a specific version (default: latest)"
       info "  --prefix    Install directory (default: ~/.muster/bin)"; exit 0 ;;
     *) die "Unknown flag: $1" ;;
   esac
 done
-if [ "$INSTALL_AGENT" -eq 0 ] && [ "$INSTALL_TUNNEL" -eq 0 ]; then
+if [ "$INSTALL_AGENT" -eq 0 ] && [ "$INSTALL_TUNNEL" -eq 0 ] && [ "$INSTALL_RELAY" -eq 0 ]; then
   INSTALL_AGENT=1; INSTALL_TUNNEL=1
 fi
 PREFIX="${PREFIX:-${HOME}/.muster/bin}"
@@ -66,6 +68,7 @@ download_binary() {
 
 if [ "$INSTALL_AGENT" -eq 1 ]; then download_binary "muster-agent"; fi
 if [ "$INSTALL_TUNNEL" -eq 1 ]; then download_binary "muster-tunnel"; fi
+if [ "$INSTALL_RELAY" -eq 1 ]; then download_binary "muster-cloud"; fi
 
 # --- PATH setup ------------------------------------------------------------
 add_to_path() {
@@ -87,6 +90,21 @@ if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$PREFIX"; then
   esac
 fi
 
+# --- check muster base -----------------------------------------------------
+if [ "$INSTALL_AGENT" -eq 1 ]; then
+  _muster_found=0
+  command -v muster >/dev/null 2>&1 && _muster_found=1
+  [ -x "${HOME}/.local/bin/muster" ] && _muster_found=1
+  [ -d "${HOME}/.muster/repo" ] && _muster_found=1
+  if [ "$_muster_found" -eq 0 ]; then
+    info ""
+    info "  [note] muster (base) is not installed."
+    info "  muster-agent requires muster on the remote machine."
+    info "  Install it with:"
+    info "    bash <(curl -fsSL https://getmuster.dev/install.sh)"
+  fi
+fi
+
 # --- done ------------------------------------------------------------------
 info ""
 info "Installation complete."
@@ -94,6 +112,7 @@ info ""
 info "Next steps:"
 if [ "$INSTALL_AGENT" -eq 1 ]; then info "  muster-agent --help    # run the fleet agent"; fi
 if [ "$INSTALL_TUNNEL" -eq 1 ]; then info "  muster-tunnel --help   # run the tunnel client"; fi
+if [ "$INSTALL_RELAY" -eq 1 ]; then info "  muster-cloud --help    # run the relay server"; fi
 info ""
 info "You may need to restart your shell or run:"
 info "  export PATH=\"${PREFIX}:\$PATH\""
