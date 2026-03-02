@@ -1,0 +1,11 @@
+# Muster Cloud Relay — Caddy reverse proxy
+#
+# Caddy handles automatic HTTPS via Let's Encrypt.
+# Replace relay.example.com with your domain.
+#
+# Usage:
+#   caddy run --config /path/to/Caddyfile
+
+relay.example.com {
+	reverse_proxy localhost:8443
+}

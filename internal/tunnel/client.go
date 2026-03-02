@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,9 +12,12 @@ import (
 
 // Client manages a WebSocket connection to the relay.
 type Client struct {
-	relayURL string
-	token    string
-	identity string // "org_id/name"
+	relayURL   string
+	token      string
+	orgID      string
+	name       string
+	clientType string // "agent" or "cli"
+	identity   string // "org_id/name"
 
 	conn *WSConn
 	mu   sync.Mutex
@@ -22,9 +26,12 @@ type Client struct {
 // NewClient creates a tunnel client.
 func NewClient(relayURL, token, orgID, name string) *Client {
 	return &Client{
-		relayURL: relayURL,
-		token:    token,
-		identity: orgID + "/" + name,
+		relayURL:   relayURL,
+		token:      token,
+		orgID:      orgID,
+		name:       name,
+		clientType: "agent",
+		identity:   orgID + "/" + name,
 	}
 }
 
@@ -45,6 +52,57 @@ func (c *Client) Connect() error {
 	c.mu.Unlock()
 
 	log.Printf("connected to relay: %s", c.relayURL)
+	return nil
+}
+
+// Authenticate sends an AUTH_REQUEST frame and reads the AUTH_RESPONSE.
+func (c *Client) Authenticate() error {
+	payload, err := json.Marshal(map[string]string{
+		"token":       c.token,
+		"client_type": c.clientType,
+		"org_id":      c.orgID,
+		"name":        c.name,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal auth payload: %w", err)
+	}
+
+	var reqID [16]byte
+	frame := protocol.NewFrame(
+		protocol.MsgAuthRequest,
+		reqID,
+		c.identity,
+		"relay",
+		0,
+		payload,
+	)
+
+	if err := c.SendFrame(frame); err != nil {
+		return fmt.Errorf("send AUTH_REQUEST: %w", err)
+	}
+
+	resp, err := c.ReadFrame()
+	if err != nil {
+		return fmt.Errorf("read AUTH_RESPONSE: %w", err)
+	}
+
+	if resp.MsgType != protocol.MsgAuthResponse {
+		return fmt.Errorf("expected AUTH_RESPONSE, got %s", protocol.MsgTypeName(resp.MsgType))
+	}
+
+	var authResp struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(resp.Payload, &authResp); err != nil {
+		return fmt.Errorf("parse AUTH_RESPONSE: %w", err)
+	}
+
+	if !authResp.OK {
+		return fmt.Errorf("authentication failed: %s", authResp.Error)
+	}
+
+	log.Printf("authenticated with relay")
 	return nil
 }
 

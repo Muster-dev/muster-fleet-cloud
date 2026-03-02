@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"github.com/Muster-dev/muster-fleet-cloud/internal/agent"
 	"github.com/Muster-dev/muster-fleet-cloud/internal/config"
 	"github.com/Muster-dev/muster-fleet-cloud/internal/crypto"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
+	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
 )
 
 var version = "0.1.0"
@@ -84,7 +87,7 @@ func cmdRun() {
 
 func cmdJoin() {
 	// Parse flags
-	var relayURL, token, orgID, name, projectDir, mode string
+	var relayURL, token, orgID, name, projectDir, mode, musterPath string
 
 	args := os.Args[2:]
 	for i := 0; i < len(args); i++ {
@@ -119,16 +122,22 @@ func cmdJoin() {
 			if i < len(args) {
 				mode = args[i]
 			}
+		case "--muster-path":
+			i++
+			if i < len(args) {
+				musterPath = args[i]
+			}
 		case "--help", "-h":
 			fmt.Println("Usage: muster-agent join --relay <url> --token <join-token> --org <org> --name <name> [options]")
 			fmt.Println()
 			fmt.Println("Options:")
-			fmt.Println("  --relay <url>      Relay WebSocket URL (wss://...)")
-			fmt.Println("  --token <token>    One-time join token")
-			fmt.Println("  --org <org>        Organization ID")
-			fmt.Println("  --name <name>      Agent name (e.g., prod-1)")
-			fmt.Println("  --project <dir>    Project directory on this machine")
-			fmt.Println("  --mode <mode>      Deploy mode: muster or push (default: muster)")
+			fmt.Println("  --relay <url>        Relay WebSocket URL (wss://...)")
+			fmt.Println("  --token <token>      One-time join token")
+			fmt.Println("  --org <org>          Organization ID")
+			fmt.Println("  --name <name>        Agent name (e.g., prod-1)")
+			fmt.Println("  --project <dir>      Project directory on this machine")
+			fmt.Println("  --mode <mode>        Deploy mode: muster or push (default: muster)")
+			fmt.Println("  --muster-path <path> Path to muster binary (default: muster)")
 			return
 		}
 	}
@@ -154,17 +163,63 @@ func cmdJoin() {
 		log.Fatalf("save keys: %v", err)
 	}
 
-	// TODO: connect to relay with join token, exchange for session token
-	// For now, store the join token as the session token (placeholder)
-	sessionToken := token
+	// Connect to relay and register with join token
+	client := tunnel.NewClient(relayURL, token, orgID, name)
+	if err := client.Connect(); err != nil {
+		log.Fatalf("connect to relay: %v", err)
+	}
+	defer client.Close()
 
+	// Authenticate with join token
+	if err := client.Authenticate(); err != nil {
+		log.Fatalf("authenticate: %v", err)
+	}
+
+	// Send AGENT_HELLO with public key
+	hello := map[string]interface{}{
+		"agent_name": name,
+		"org_id":     orgID,
+		"version":    version,
+		"public_key": keys.PublicKeyBase64(),
+	}
+	helloPayload, err := json.Marshal(hello)
+	if err != nil {
+		log.Fatalf("marshal hello: %v", err)
+	}
+
+	var reqID [16]byte
+	helloFrame := protocol.NewFrame(
+		protocol.MsgAgentHello,
+		reqID,
+		client.Identity(),
+		"relay",
+		0,
+		helloPayload,
+	)
+	if err := client.SendFrame(helloFrame); err != nil {
+		log.Fatalf("send AGENT_HELLO: %v", err)
+	}
+
+	// Wait for RELAY_ACK
+	ackFrame, err := client.ReadFrame()
+	if err != nil {
+		log.Fatalf("read RELAY_ACK: %v", err)
+	}
+	if ackFrame.MsgType != protocol.MsgRelayAck {
+		log.Fatalf("expected RELAY_ACK, got %s", protocol.MsgTypeName(ackFrame.MsgType))
+	}
+
+	// Save config (store join token for now -- session token rotation comes later)
 	cfg := config.DefaultAgentConfig()
 	cfg.Relay.URL = relayURL
-	cfg.Relay.Token = sessionToken
+	cfg.Relay.Token = token
 	cfg.Identity.OrgID = orgID
 	cfg.Identity.Name = name
 	cfg.Project.Dir = projectDir
 	cfg.Project.Mode = mode
+	if musterPath != "" {
+		cfg.MusterPath = musterPath
+	}
 
 	if err := config.SaveAgentConfig(cfg); err != nil {
 		log.Fatalf("save config: %v", err)

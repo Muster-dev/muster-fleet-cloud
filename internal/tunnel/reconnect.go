@@ -47,7 +47,24 @@ func (c *Client) ConnectLoop(ctx context.Context, cfg ReconnectConfig, onConnect
 			}
 		}
 
-		// Connection established
+		// Authenticate with relay
+		if err := c.Authenticate(); err != nil {
+			c.Close()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			delay := backoff(attempt, cfg)
+			log.Printf("auth failed: %v, reconnecting in %s", err, delay)
+			select {
+			case <-time.After(delay):
+				attempt++
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		// Connection established and authenticated
 		attempt = 0
 		connectedAt := time.Now()
 

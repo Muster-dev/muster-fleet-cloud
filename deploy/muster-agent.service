@@ -1,0 +1,33 @@
+[Unit]
+Description=Muster Fleet Agent
+Documentation=https://github.com/Muster-dev/muster-fleet-cloud
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=muster
+Group=muster
+WorkingDirectory=/var/lib/muster
+
+ExecStart=/usr/local/bin/muster-agent run --config /etc/muster/agent.json
+Restart=always
+RestartSec=5
+
+# Optional environment overrides
+EnvironmentFile=-/etc/muster/agent.env
+
+# Security hardening
+ProtectSystem=full
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/var/lib/muster
+
+# Logging — stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=muster-agent
+
+[Install]
+WantedBy=multi-user.target

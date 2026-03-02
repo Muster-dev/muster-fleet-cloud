@@ -6,20 +6,22 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Muster-dev/muster-fleet-cloud/internal/auth"
 	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
 	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
 )
 
 // Server is the muster-cloud relay server.
 type Server struct {
-	router *Router
-	// TODO: add auth store
+	router     *Router
+	tokenStore *auth.TokenStore
 }
 
-// NewServer creates a relay server.
-func NewServer() *Server {
+// NewServer creates a relay server with the given token store.
+func NewServer(tokenStore *auth.TokenStore) *Server {
 	return &Server{
-		router: NewRouter(),
+		router:     NewRouter(),
+		tokenStore: tokenStore,
 	}
 }
 
@@ -88,7 +90,41 @@ func (s *Server) handleTunnel(ws *tunnel.WSConn) {
 		return
 	}
 
-	// TODO: validate token against auth store
+	// Validate token against auth store
+	tok, err := s.tokenStore.ValidateToken(authPayload.Token)
+	if err != nil {
+		log.Printf("auth failed for %s/%s: %v", authPayload.OrgID, authPayload.Name, err)
+		s.sendAuthError(ws, frame.RequestID, authPayload.OrgID+"/"+authPayload.Name, "invalid or expired token")
+		return
+	}
+
+	// Check org matches
+	if tok.OrgID != authPayload.OrgID {
+		log.Printf("auth failed: token org %q != request org %q", tok.OrgID, authPayload.OrgID)
+		s.sendAuthError(ws, frame.RequestID, authPayload.OrgID+"/"+authPayload.Name, "org mismatch")
+		return
+	}
+
+	// Check token type matches client type
+	validType := false
+	switch authPayload.ClientType {
+	case "agent":
+		validType = tok.TokenType == auth.TypeAgentJoin || tok.TokenType == auth.TypeAgentSession || tok.TokenType == auth.TypeAdmin
+	case "cli":
+		validType = tok.TokenType == auth.TypeCLI || tok.TokenType == auth.TypeAdmin
+	}
+	if !validType {
+		log.Printf("auth failed: token type %q not valid for client_type %q", tok.TokenType, authPayload.ClientType)
+		s.sendAuthError(ws, frame.RequestID, authPayload.OrgID+"/"+authPayload.Name, "token type mismatch")
+		return
+	}
+
+	// For agent-join tokens, mark as used after first successful auth
+	if tok.TokenType == auth.TypeAgentJoin {
+		if err := s.tokenStore.MarkUsed(tok.ID); err != nil {
+			log.Printf("mark join token used: %v", err)
+		}
+	}
 
 	// Send AUTH_RESPONSE
 	authResp, _ := json.Marshal(map[string]interface{}{
@@ -232,4 +268,21 @@ func (s *Server) routeLoop(ws *tunnel.WSConn, conn *Conn) {
 			destConn.mu.Unlock()
 		}
 	}
+}
+
+func (s *Server) sendAuthError(ws *tunnel.WSConn, requestID [16]byte, destID, message string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"ok":      false,
+		"code":    protocol.ErrAuth,
+		"message": message,
+	})
+	f := protocol.NewFrame(
+		protocol.MsgAuthResponse,
+		requestID,
+		"relay",
+		destID,
+		0,
+		payload,
+	)
+	ws.Write(protocol.Encode(f))
 }

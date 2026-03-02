@@ -1,0 +1,24 @@
+{
+  "relay": {
+    "url": "wss://your-relay-server.example.com:8443",
+    "token": "your-agent-token-here"
+  },
+  "identity": {
+    "org_id": "your-org-id",
+    "name": "prod-server-01"
+  },
+  "project": {
+    "dir": "/opt/myapp",
+    "mode": "muster"
+  },
+  "muster_path": "/usr/local/bin/muster",
+  "allowed_commands": [
+    "muster deploy",
+    "muster status",
+    "muster rollback",
+    "muster logs"
+  ],
+  "log_file": "/var/lib/muster/agent.log",
+  "reconnect_base_delay": "1s",
+  "reconnect_max_delay": "60s"
+}
