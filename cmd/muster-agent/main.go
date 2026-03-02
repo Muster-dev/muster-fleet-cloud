@@ -32,7 +32,7 @@ func main() {
 		cmdJoin()
 	case "status":
 		cmdStatus()
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Printf("muster-agent %s\n", version)
 	case "--help", "-h", "help":
 		printUsage()

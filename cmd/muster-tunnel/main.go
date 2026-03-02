@@ -28,7 +28,7 @@ func main() {
 		cmdPing()
 	case "agents":
 		cmdAgents()
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Printf("muster-tunnel %s\n", version)
 	case "--help", "-h", "help":
 		printUsage()

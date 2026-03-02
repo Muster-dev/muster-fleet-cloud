@@ -19,7 +19,7 @@ var version = "0.1.0"
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "version":
+		case "version", "--version", "-v":
 			fmt.Printf("muster-cloud %s\n", version)
 			return
 		case "--help", "-h", "help":
