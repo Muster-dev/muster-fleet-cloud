@@ -1,6 +1,8 @@
 # muster-fleet-cloud
 
-Client-side transport for [muster](https://github.com/Muster-dev/muster) fleet deployments. Run muster commands on remote machines through a WebSocket relay with end-to-end encryption.
+Cloud transport addon for [muster](https://github.com/Muster-dev/muster). Run muster commands on remote machines through a WebSocket relay with end-to-end encryption — no direct SSH required.
+
+Works with both `muster fleet` (one project, many machines) and `muster group` (many projects, coordinated deploys). Machines on different LANs, behind NATs, or across cloud providers all work through the relay.
 
 This repo contains the **agent** and **tunnel** (client-side binaries). The relay server is hosted separately.
 
@@ -30,7 +32,7 @@ This repo contains the **agent** and **tunnel** (client-side binaries). The rela
 ## Binaries
 
 - **muster-agent** -- Daemon that runs on each remote machine. Maintains a persistent WebSocket connection to the relay, receives commands, executes them locally via muster, and streams output back.
-- **muster-tunnel** -- CLI helper invoked by `muster fleet` on your laptop. Connects to the relay, sends commands (`exec`, `push`, `ping`), and prints streamed output. Also lists connected agents.
+- **muster-tunnel** -- CLI helper invoked by `muster fleet` and `muster group` on your laptop. Connects to the relay, sends commands (`exec`, `push`, `ping`), and prints streamed output. Also lists connected agents.
 
 ## Install
 
@@ -148,6 +150,87 @@ sudo journalctl -u muster-agent -f
 ```
 
 The service runs as a dedicated `muster` user with systemd security hardening (ProtectSystem, NoNewPrivileges, PrivateTmp).
+
+## Integration with Muster CLI
+
+The muster bash CLI calls `muster-tunnel` automatically when a fleet machine or group project has cloud transport enabled.
+
+### Fleet (one project → many machines)
+
+```bash
+# Add a cloud machine to your fleet
+muster fleet add prod-east deploy@prod-east --transport cloud --path /opt/myapp
+
+# Deploy — cloud machines route through the relay, SSH machines use direct SSH
+muster fleet deploy
+```
+
+Config in `remotes.json`:
+```json
+{
+  "machines": {
+    "prod-east": {
+      "host": "prod-east",
+      "user": "deploy",
+      "transport": "cloud",
+      "project_dir": "/opt/myapp",
+      "mode": "muster"
+    }
+  }
+}
+```
+
+### Group (many projects → coordinated deploy)
+
+```bash
+# Add a cloud project to a group
+muster group add production agent-prod-east --cloud --path /opt/api
+
+# Deploy all projects in the group
+muster group deploy production
+```
+
+Config in `~/.muster/groups.json`:
+```json
+{
+  "groups": {
+    "production": {
+      "projects": [
+        {"type": "local", "path": "/home/me/frontend"},
+        {"type": "remote", "host": "agent-prod-east", "user": "deploy",
+         "cloud": true, "project_dir": "/opt/api"}
+      ]
+    }
+  }
+}
+```
+
+### Global Cloud Settings
+
+Set once in `~/.muster/settings.json`:
+```json
+{
+  "cloud": {
+    "relay": "wss://relay.example.com",
+    "org_id": "myorg",
+    "token": "mst_cli_<your-token>"
+  }
+}
+```
+
+Or via CLI: `muster settings --global cloud.relay '"wss://relay.example.com"'`
+
+### How the Bash CLI Calls the Tunnel
+
+`lib/core/cloud.sh` shells out to `muster-tunnel`:
+
+| Bash function | Tunnel command |
+|---|---|
+| `_fleet_cloud_exec "$agent" "$cmd" "$cwd"` | `muster-tunnel exec --agent <name> --cmd <cmd> --cwd <dir>` |
+| `_fleet_cloud_push "$agent" "$hook" "$env"` | `muster-tunnel push --agent <name> --hook <file> --env <vars>` |
+| `_fleet_cloud_check "$agent"` | `muster-tunnel ping --agent <name>` |
+
+Relay URL, token, and org are passed via `--relay`, `--token`, `--org` flags.
 
 ## Development
 

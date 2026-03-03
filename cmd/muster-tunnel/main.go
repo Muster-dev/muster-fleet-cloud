@@ -42,14 +42,27 @@ func main() {
 func printUsage() {
 	fmt.Println("Usage: muster-tunnel <command> [options]")
 	fmt.Println()
-	fmt.Println("CLI helper for muster cloud transport. Used by 'muster fleet' for cloud machines.")
+	fmt.Println("Cloud transport for muster fleet and group deployments.")
+	fmt.Println("Routes commands through a WebSocket relay to remote muster-agents.")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  exec     Execute a command on a remote agent")
 	fmt.Println("  push     Push a hook script to a remote agent")
 	fmt.Println("  ping     Test connectivity to a remote agent")
-	fmt.Println("  agents   List connected agents")
+	fmt.Println("  agents   List connected agents in your org")
 	fmt.Println("  version  Print version")
+	fmt.Println()
+	fmt.Println("Common flags:")
+	fmt.Println("  --relay URL     Relay WebSocket URL (wss://...)")
+	fmt.Println("  --token TOKEN   CLI access token (mst_cli_...)")
+	fmt.Println("  --org ORG       Organization ID")
+	fmt.Println("  --agent NAME    Target agent name")
+	fmt.Println()
+	fmt.Println("Exec/Push flags:")
+	fmt.Println("  --cmd COMMAND   Command to execute (exec only)")
+	fmt.Println("  --hook FILE     Hook script to push (push only)")
+	fmt.Println("  --env VARS      Env vars as KEY=val,KEY2=val2 (push only)")
+	fmt.Println("  --cwd DIR       Working directory on the remote agent")
 }
 
 // commonFlags parses the standard --relay, --token, --org, --agent flags.
@@ -146,11 +159,19 @@ func connectAndAuth(f commonFlags, clientName string) (*tunnel.WSConn, error) {
 func cmdExec() {
 	flags, remaining := parseCommonFlags(os.Args[2:])
 
-	var cmd string
+	var cmd, cwd string
 	for i := 0; i < len(remaining); i++ {
-		if remaining[i] == "--cmd" && i+1 < len(remaining) {
-			cmd = remaining[i+1]
-			break
+		switch remaining[i] {
+		case "--cmd":
+			if i+1 < len(remaining) {
+				cmd = remaining[i+1]
+				i++
+			}
+		case "--cwd":
+			if i+1 < len(remaining) {
+				cwd = remaining[i+1]
+				i++
+			}
 		}
 	}
 
@@ -167,11 +188,15 @@ func cmdExec() {
 	defer conn.Close()
 
 	// Send COMMAND
-	cmdPayload, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"action":  "exec",
 		"command": cmd,
 		"stream":  true,
-	})
+	}
+	if cwd != "" {
+		payload["cwd"] = cwd
+	}
+	cmdPayload, _ := json.Marshal(payload)
 
 	destID := flags.org + "/" + flags.agent
 	var reqID [16]byte
@@ -241,7 +266,7 @@ func cmdExec() {
 func cmdPush() {
 	flags, remaining := parseCommonFlags(os.Args[2:])
 
-	var hookFile, envStr string
+	var hookFile, envStr, cwd string
 	for i := 0; i < len(remaining); i++ {
 		switch remaining[i] {
 		case "--hook":
@@ -252,6 +277,11 @@ func cmdPush() {
 		case "--env":
 			if i+1 < len(remaining) {
 				envStr = remaining[i+1]
+				i++
+			}
+		case "--cwd":
+			if i+1 < len(remaining) {
+				cwd = remaining[i+1]
 				i++
 			}
 		}
@@ -285,12 +315,16 @@ func cmdPush() {
 		}
 	}
 
-	cmdPayload, _ := json.Marshal(map[string]interface{}{
+	pushPayload := map[string]interface{}{
 		"action":  "push_hook",
 		"command": string(script),
 		"env":     env,
 		"stream":  true,
-	})
+	}
+	if cwd != "" {
+		pushPayload["cwd"] = cwd
+	}
+	cmdPayload, _ := json.Marshal(pushPayload)
 
 	destID := flags.org + "/" + flags.agent
 	var reqID [16]byte
