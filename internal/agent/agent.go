@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"log"
 
-	"github.com/Muster-dev/muster-fleet-cloud/internal/config"
-	"github.com/Muster-dev/muster-fleet-cloud/internal/crypto"
-	"github.com/Muster-dev/muster-fleet-cloud/internal/protocol"
-	"github.com/Muster-dev/muster-fleet-cloud/internal/tunnel"
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/crypto"
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/tunnel"
 )
 
 // Agent is the muster-agent daemon.
