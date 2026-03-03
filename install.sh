@@ -55,6 +55,102 @@ if [ -z "$VERSION" ]; then
 fi
 info "Installing muster-fleet-cloud v${VERSION} (${OS}/${ARCH})"
 
+# --- preview + confirm -----------------------------------------------------
+_interactive=false
+[ -t 0 ] && _interactive=true
+# curl | bash: stdin is the script, but /dev/tty is the terminal
+[ -e /dev/tty ] && _interactive=true
+
+info ""
+info "  This will install:"
+info ""
+info "  Binaries (${PREFIX}):"
+if [ "$INSTALL_AGENT" -eq 1 ]; then info "    muster-agent     Fleet deploy agent"; fi
+if [ "$INSTALL_TUNNEL" -eq 1 ]; then info "    muster-tunnel    Cloud tunnel client"; fi
+if [ "$INSTALL_RELAY" -eq 1 ]; then  info "    muster-cloud     Cloud relay server"; fi
+info ""
+
+# Check if PATH addition will be needed
+_needs_path=false
+if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$PREFIX"; then
+  _needs_path=true
+  _shell_profile=""
+  case "$(basename "${SHELL:-/bin/bash}")" in
+    zsh)  _shell_profile="${HOME}/.zshrc" ;;
+    bash) [ -f "${HOME}/.bash_profile" ] \
+            && _shell_profile="${HOME}/.bash_profile" \
+            || _shell_profile="${HOME}/.bashrc" ;;
+  esac
+  if [ -n "$_shell_profile" ]; then
+    # Only show if not already in the file
+    _already_in=false
+    if [ -f "$_shell_profile" ]; then
+      case "$(cat "$_shell_profile")" in *"$PREFIX"*) _already_in=true ;; esac
+    fi
+    if [ "$_already_in" = false ]; then
+      info "  Shell config:"
+      info "    ${_shell_profile}  (add ${PREFIX} to PATH)"
+      info ""
+    fi
+  fi
+fi
+
+if [ "$_interactive" = true ]; then
+  printf '  Proceed with install? [Y/n] '
+  read -r _proceed </dev/tty
+  case "${_proceed:-Y}" in
+    [Yy]|"") ;;
+    *) info ""; info "  Install cancelled."; exit 0 ;;
+  esac
+  info ""
+fi
+
+# --- check muster base (before installing fleet components) ----------------
+_muster_found=0
+command -v muster >/dev/null 2>&1 && _muster_found=1
+[ -x "${HOME}/.local/bin/muster" ] && _muster_found=1
+[ -d "${HOME}/.muster/repo" ] && _muster_found=1
+
+if [ "$_muster_found" -eq 0 ]; then
+  info "  muster (base) is not installed."
+  if [ "$INSTALL_AGENT" -eq 1 ]; then
+    info "  muster-agent requires muster on the remote machine."
+  fi
+  info ""
+
+  if [ "$_interactive" = true ]; then
+    printf '  Install muster first? [Y/n] '
+    read -r _install_muster </dev/tty
+    case "${_install_muster:-Y}" in
+      [Yy]|"")
+        info ""
+        info "  Installing muster..."
+        info ""
+        if command -v curl >/dev/null 2>&1; then
+          bash <(curl -fsSL https://raw.githubusercontent.com/Muster-dev/muster/main/install.sh) </dev/tty
+        elif command -v wget >/dev/null 2>&1; then
+          bash <(wget -qO- https://raw.githubusercontent.com/Muster-dev/muster/main/install.sh) </dev/tty
+        else
+          die "curl or wget required to install muster"
+        fi
+        info ""
+        info "  Continuing with fleet cloud install..."
+        info ""
+        ;;
+      *)
+        info ""
+        info "  Skipping muster install. You can install it later with:"
+        info "    bash <(curl -fsSL https://getmuster.dev/install.sh)"
+        info ""
+        ;;
+    esac
+  else
+    info "  Install muster first:"
+    info "    bash <(curl -fsSL https://getmuster.dev/install.sh)"
+    info ""
+  fi
+fi
+
 # --- download + install ----------------------------------------------------
 mkdir -p "$PREFIX"
 
@@ -88,21 +184,6 @@ if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$PREFIX"; then
             || add_to_path "${HOME}/.bashrc" ;;
     *)    info "  [note] Add ${PREFIX} to your PATH manually." ;;
   esac
-fi
-
-# --- check muster base -----------------------------------------------------
-if [ "$INSTALL_AGENT" -eq 1 ]; then
-  _muster_found=0
-  command -v muster >/dev/null 2>&1 && _muster_found=1
-  [ -x "${HOME}/.local/bin/muster" ] && _muster_found=1
-  [ -d "${HOME}/.muster/repo" ] && _muster_found=1
-  if [ "$_muster_found" -eq 0 ]; then
-    info ""
-    info "  [note] muster (base) is not installed."
-    info "  muster-agent requires muster on the remote machine."
-    info "  Install it with:"
-    info "    bash <(curl -fsSL https://getmuster.dev/install.sh)"
-  fi
 fi
 
 # --- done ------------------------------------------------------------------
