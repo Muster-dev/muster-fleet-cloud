@@ -194,6 +194,8 @@ info "Next steps:"
 if [ "$INSTALL_AGENT" -eq 1 ]; then info "  muster-agent --help    # run the fleet agent"; fi
 if [ "$INSTALL_TUNNEL" -eq 1 ]; then info "  muster-tunnel --help   # run the tunnel client"; fi
 if [ "$INSTALL_RELAY" -eq 1 ]; then info "  muster-cloud --help    # run the relay server"; fi
-info ""
-info "You may need to restart your shell or run:"
-info "  export PATH=\"${PREFIX}:\$PATH\""
+if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$PREFIX"; then
+  info ""
+  info "You may need to restart your shell or run:"
+  info "  export PATH=\"${PREFIX}:\$PATH\""
+fi
