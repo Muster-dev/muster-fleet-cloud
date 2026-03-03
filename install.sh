@@ -32,7 +32,7 @@ done
 if [ "$INSTALL_AGENT" -eq 0 ] && [ "$INSTALL_TUNNEL" -eq 0 ] && [ "$INSTALL_RELAY" -eq 0 ]; then
   INSTALL_AGENT=1; INSTALL_TUNNEL=1
 fi
-PREFIX="${PREFIX:-${HOME}/.local/bin}"
+PREFIX="${PREFIX:-${MUSTER_BIN_DIR:-${HOME}/.local/bin}}"
 
 # --- detect platform -------------------------------------------------------
 case "$(uname -s)" in
