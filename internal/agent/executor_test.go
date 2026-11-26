@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
 )
 
@@ -102,7 +104,7 @@ func TestExecutorRunsWithoutShell(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := newTestExecutor(t, ExecutorOptions{MusterPath: fake, DefaultCwd: dir})
-	ch, err := e.Execute(context.Background(), &protocol.CommandRequest{Action: "exec", Command: `muster status "a b"`})
+	ch, err := e.Execute(context.Background(), &protocol.CommandRequest{Action: "exec", Command: `muster status "a b"`}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +129,7 @@ func TestExecutorRunsWithoutShell(t *testing.T) {
 func TestExecutorPushModeAndShell(t *testing.T) {
 	ctx := context.Background()
 	e := newTestExecutor(t, ExecutorOptions{AllowPush: true})
-	ch, err := e.Execute(ctx, &protocol.CommandRequest{Action: "push_hook", Command: "echo pushed-$FOO", Env: map[string]string{"FOO": "bar"}})
+	ch, err := e.Execute(ctx, &protocol.CommandRequest{Action: "push_hook", Command: "echo pushed-$FOO", Env: map[string]string{"FOO": "bar"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,5 +158,40 @@ func TestReplayCache(t *testing.T) {
 	}
 	if c.add(n) {
 		t.Fatal("replay accepted")
+	}
+}
+
+func TestExecutorCancelledBeforeStart(t *testing.T) {
+	e := newTestExecutor(t, ExecutorOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.Execute(ctx, &protocol.CommandRequest{Action: "exec", Command: "echo hello"}, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMergeEnv(t *testing.T) {
+	got := mergeEnv([]string{"A=1", "MUSTER_DEPLOY_SOURCE=evil", "B=2=3"}, map[string]string{"MUSTER_DEPLOY_SOURCE": "cloud:x", "C": ""})
+	want := []string{"A=1", "B=2=3", "C=", "MUSTER_DEPLOY_SOURCE=cloud:x"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestDefaultAllowlist(t *testing.T) {
+	e := NewExecutor(ExecutorOptions{AllowedCommands: config.DefaultAllowedCommands()})
+	ok := []string{"muster deploy api --force", "muster status --json", "muster rollback api", "muster logs api",
+		"muster history --all", "muster --version", "muster hooks verify api"}
+	bad := []string{"muster hooks approve api", "muster hooks", "muster hooks lock", "muster setup", "muster uninstall",
+		"muster settings --global color_mode never", "muster --versionx", "muster fleet deploy"}
+	for _, c := range ok {
+		if _, err := e.BuildCommand(context.Background(), &protocol.CommandRequest{Action: "exec", Command: c}); err != nil {
+			t.Errorf("%q rejected: %v", c, err)
+		}
+	}
+	for _, c := range bad {
+		if _, err := e.BuildCommand(context.Background(), &protocol.CommandRequest{Action: "exec", Command: c}); err == nil {
+			t.Errorf("%q allowed", c)
+		}
 	}
 }

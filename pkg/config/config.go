@@ -23,6 +23,12 @@ type AgentConfig struct {
 	// Off by default: commands must be end-to-end encrypted.
 	AllowPlaintext bool   `json:"allow_plaintext,omitempty"`
 	LogFile        string `json:"log_file,omitempty"`
+	// CLIKeyPolicy controls pinning of CLI identity keys per CLI token:
+	// "tofu" (default): the first persistent key seen for a token is pinned
+	// and later commands under that token must use it; "strict": only keys
+	// already pinned (muster-agent trust add) are accepted; "off": no
+	// checks. See docs/protocol.md.
+	CLIKeyPolicy string `json:"cli_key_policy,omitempty"`
 
 	ReconnectBaseDelay string `json:"reconnect_base_delay,omitempty"`
 	ReconnectMaxDelay  string `json:"reconnect_max_delay,omitempty"`
@@ -49,16 +55,44 @@ type ProjectConfig struct {
 	Mode string `json:"mode"` // "muster" or "push"
 }
 
+// CLI key policies (AgentConfig.CLIKeyPolicy).
+const (
+	CLIKeyPolicyTOFU   = "tofu"
+	CLIKeyPolicyStrict = "strict"
+	CLIKeyPolicyOff    = "off"
+)
+
+// ValidCLIKeyPolicy reports whether p is a known policy ("" means tofu).
+func ValidCLIKeyPolicy(p string) bool {
+	switch p {
+	case "", CLIKeyPolicyTOFU, CLIKeyPolicyStrict, CLIKeyPolicyOff:
+		return true
+	}
+	return false
+}
+
+// DefaultAllowedCommands is the exec allowlist written by `muster-agent
+// join`. Entries match word by word as a prefix of the command's argv
+// ("muster deploy" allows "muster deploy api --force"). Only subcommands
+// that exist in the muster CLI are listed; "muster hooks verify" is the
+// read-only part of "muster hooks" (approve/lock/unlock are not allowed).
+func DefaultAllowedCommands() []string {
+	return []string{
+		"muster deploy",
+		"muster status",
+		"muster rollback",
+		"muster logs",
+		"muster history",
+		"muster --version",
+		"muster hooks verify",
+	}
+}
+
 // DefaultAgentConfig returns sensible defaults for the agent.
 func DefaultAgentConfig() *AgentConfig {
 	return &AgentConfig{
-		MusterPath: "muster",
-		AllowedCommands: []string{
-			"muster deploy",
-			"muster status",
-			"muster rollback",
-			"muster logs",
-		},
+		MusterPath:         "muster",
+		AllowedCommands:    DefaultAllowedCommands(),
 		ReconnectBaseDelay: "1s",
 		ReconnectMaxDelay:  "60s",
 	}
@@ -87,6 +121,12 @@ func AgentConfigPath() string {
 // (a "keys" directory next to it).
 func KeyDirFor(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "keys")
+}
+
+// TrustedCLIsPath returns the file holding pinned CLI keys that belongs to
+// a config file (trusted_clis.json next to it).
+func TrustedCLIsPath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), "trusted_clis.json")
 }
 
 // LoadAgentConfig reads the agent config from the default path.

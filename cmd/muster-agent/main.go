@@ -8,7 +8,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"text/tabwriter"
 
 	"github.com/Muster-dev/muster-fleet-cloud/internal/agent"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
@@ -31,6 +33,8 @@ func main() {
 		cmdJoin(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "trust":
+		cmdTrust(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("muster-agent %s\n", version)
 	case "--help", "-h", "help":
@@ -49,6 +53,7 @@ func printUsage() {
 	fmt.Println("  join      Enroll this machine with a relay using a one-time join token")
 	fmt.Println("  run       Start the agent daemon (foreground)")
 	fmt.Println("  status    Show agent configuration")
+	fmt.Println("  trust     List, add or reset pinned CLI keys (trust list|add|reset)")
 	fmt.Println("  version   Print version")
 	fmt.Println()
 	fmt.Println("All commands accept --config <path> (default: $MUSTER_AGENT_CONFIG or ~/.muster-agent/config.json).")
@@ -96,6 +101,7 @@ func cmdJoin(args []string) {
 	projectDir := fs.String("project", "", "project directory on this machine")
 	mode := fs.String("mode", "muster", "deploy mode: muster or push")
 	musterPath := fs.String("muster-path", "", "path to the muster binary (default: muster)")
+	keyPolicy := fs.String("cli-key-policy", "", "CLI key pinning: tofu (default), strict or off")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: muster-agent join --token mst_agent_... [--relay wss://relay.getmuster.dev] [--name prod-1] [--project /opt/app]")
 		fmt.Fprintln(os.Stderr)
@@ -110,6 +116,10 @@ func cmdJoin(args []string) {
 	}
 	if !agent.IsJoinToken(*token) {
 		fmt.Fprintln(os.Stderr, "error: --token must be a join token (mst_agent_...)")
+		os.Exit(2)
+	}
+	if !config.ValidCLIKeyPolicy(*keyPolicy) {
+		fmt.Fprintln(os.Stderr, "error: --cli-key-policy must be tofu, strict or off")
 		os.Exit(2)
 	}
 	if *mode != "muster" && *mode != "push" {
@@ -153,6 +163,9 @@ func cmdJoin(args []string) {
 	cfg.Project.Mode = *mode
 	if *musterPath != "" {
 		cfg.MusterPath = *musterPath
+	}
+	if *keyPolicy != "" {
+		cfg.CLIKeyPolicy = *keyPolicy
 	}
 
 	a, err := agent.New(cfg, keys, agent.Options{ConfigPath: *configPath, Version: version})
@@ -199,5 +212,99 @@ func cmdStatus(args []string) {
 	if keys, err := crypto.LoadKeyPair(config.KeyDirFor(*configPath)); err == nil {
 		fmt.Printf("Key:        %s\n", crypto.Fingerprint(keys.PublicKey))
 	}
+	policy := cfg.CLIKeyPolicy
+	if policy == "" {
+		policy = config.CLIKeyPolicyTOFU
+	}
+	fmt.Printf("CLI keys:   %s (pins in %s)\n", policy, config.TrustedCLIsPath(*configPath))
+	if cfg.AllowShell {
+		fmt.Printf("Commands:   ANY (allow_shell is on)\n")
+	} else {
+		fmt.Printf("Commands:   %s\n", strings.Join(cfg.AllowedCommands, ", "))
+	}
 	fmt.Printf("Config:     %s\n", *configPath)
+}
+
+func cmdTrust(args []string) {
+	usage := func() {
+		fmt.Fprintln(os.Stderr, "Usage: muster-agent trust list [--config PATH]")
+		fmt.Fprintln(os.Stderr, "       muster-agent trust add <token-id> <cli-public-key-base64> [--name NAME] [--config PATH]")
+		fmt.Fprintln(os.Stderr, "       muster-agent trust reset <token-id>|--all [--config PATH]")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "The agent pins the key each CLI token seals commands with. 'muster-tunnel whoami'")
+		fmt.Fprintln(os.Stderr, "prints the token ID and public key on the CLI machine.")
+	}
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("trust "+sub, flag.ExitOnError)
+	configPath := fs.String("config", config.AgentConfigPath(), "agent config file")
+	name := fs.String("name", "", "display name for the token (add)")
+	all := fs.Bool("all", false, "reset every pin (reset)")
+	// Allow flags before or after positional arguments.
+	var pos []string
+	for len(rest) > 0 {
+		_ = fs.Parse(rest)
+		if fs.NArg() == 0 {
+			break
+		}
+		pos = append(pos, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
+	ts := agent.NewTrustStore(config.TrustedCLIsPath(*configPath))
+
+	switch sub {
+	case "list":
+		list, err := ts.List()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(list) == 0 {
+			fmt.Println("No pinned CLI keys.")
+			return
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "TOKEN ID\tNAME\tKEY\tPINNED\tSOURCE")
+		for _, e := range list {
+			fp := "?"
+			if k, err := crypto.DecodePublicKey(e.Key); err == nil {
+				fp = crypto.Fingerprint(k)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.TokenID, e.TokenName, fp, e.PinnedAt.Format("2006-01-02 15:04"), e.Source)
+		}
+		_ = tw.Flush()
+	case "add":
+		if len(pos) != 2 {
+			usage()
+			os.Exit(2)
+		}
+		key, err := crypto.DecodePublicKey(pos[1])
+		if err != nil {
+			log.Fatalf("public key: %v", err)
+		}
+		if err := ts.Add(pos[0], *name, key); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Pinned %s for token %s\n", crypto.Fingerprint(key), pos[0])
+	case "reset":
+		id := ""
+		switch {
+		case *all && len(pos) == 0:
+		case !*all && len(pos) == 1:
+			id = pos[0]
+		default:
+			usage()
+			os.Exit(2)
+		}
+		n, err := ts.Reset(id)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Removed %d pin(s). The next command from that CLI will be pinned again (tofu).\n", n)
+	default:
+		usage()
+		os.Exit(2)
+	}
 }

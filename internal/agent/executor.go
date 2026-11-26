@@ -10,7 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
 )
@@ -24,6 +28,9 @@ type OutputLine struct {
 	Stream   string `json:"stream,omitempty"` // "stdout" or "stderr"
 	ExitCode int    `json:"exit_code,omitempty"`
 	Done     bool   `json:"done,omitempty"`
+	// Cancelled is set on the Done line when the command was stopped
+	// because its context was cancelled.
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
 // ExecutorOptions configures an Executor.
@@ -184,8 +191,10 @@ func (e *Executor) allowed(argv []string) bool {
 	return false
 }
 
-// BuildCommand turns a request into an *exec.Cmd after validation.
-func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec.Cmd, error) {
+// BuildCommand turns a request into an *exec.Cmd after validation. The
+// command is not bound to ctx: Execute handles cancellation (it must kill the
+// whole process group, not just the leader).
+func (e *Executor) BuildCommand(_ context.Context, req *CommandRequest) (*exec.Cmd, error) {
 	if err := validateEnv(req.Env); err != nil {
 		return nil, err
 	}
@@ -205,12 +214,12 @@ func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec
 		if !e.opts.AllowPush {
 			return nil, fmt.Errorf("push_hook is disabled (agent is not in push mode)")
 		}
-		cmd = exec.CommandContext(ctx, "bash", "-s")
+		cmd = exec.Command("bash", "-s")
 		cmd.Stdin = strings.NewReader(req.Command)
 
 	case "exec":
 		if e.opts.AllowShell {
-			cmd = exec.CommandContext(ctx, "bash", "-c", req.Command)
+			cmd = exec.Command("bash", "-c", req.Command)
 			break
 		}
 		argv, err := SplitArgs(req.Command)
@@ -227,21 +236,21 @@ func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec
 		if bin == "muster" {
 			bin = e.opts.MusterPath
 		}
-		cmd = exec.CommandContext(ctx, bin, argv[1:]...)
+		cmd = exec.Command(bin, argv[1:]...)
 
 	case "deploy", "rollback":
 		argv := append([]string{"muster", req.Action, "--json"}, req.Services...)
 		if !e.allowed(argv) {
 			return nil, fmt.Errorf("command rejected: muster %s not in allowlist", req.Action)
 		}
-		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+		cmd = exec.Command(e.opts.MusterPath, argv[1:]...)
 
 	case "status":
 		argv := []string{"muster", "status", "--json"}
 		if !e.allowed(argv) {
 			return nil, fmt.Errorf("command rejected: muster status not in allowlist")
 		}
-		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+		cmd = exec.Command(e.opts.MusterPath, argv[1:]...)
 
 	case "logs":
 		if len(req.Services) == 0 {
@@ -251,7 +260,7 @@ func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec
 		if !e.allowed(argv) {
 			return nil, fmt.Errorf("command rejected: muster logs not in allowlist")
 		}
-		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+		cmd = exec.Command(e.opts.MusterPath, argv[1:]...)
 
 	default:
 		return nil, fmt.Errorf("unknown action: %q", req.Action)
@@ -267,13 +276,26 @@ func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec
 	return cmd, nil
 }
 
+// KillGrace is how long a cancelled command's process group gets between
+// SIGTERM and SIGKILL.
+var KillGrace = 3 * time.Second
+
 // Execute validates and runs a request, streaming merged stdout/stderr line
 // by line. The final value on the channel has Done=true and the exit code.
-func (e *Executor) Execute(ctx context.Context, req *CommandRequest) (<-chan OutputLine, error) {
+//
+// sysEnv holds variables the agent controls (caller identity); they are
+// applied last and override both the agent's environment and req.Env.
+//
+// The command runs in its own process group. When ctx is cancelled the
+// whole group gets SIGTERM, then SIGKILL after KillGrace, and the result is
+// reported as Cancelled with exit code 130.
+func (e *Executor) Execute(ctx context.Context, req *CommandRequest, sysEnv map[string]string) (<-chan OutputLine, error) {
 	cmd, err := e.BuildCommand(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	cmd.Env = mergeEnv(cmd.Env, sysEnv)
+	setProcessGroup(cmd)
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -282,12 +304,49 @@ func (e *Executor) Execute(ctx context.Context, req *CommandRequest) (<-chan Out
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 
+	if err := ctx.Err(); err != nil {
+		pr.Close()
+		pw.Close()
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
 		return nil, fmt.Errorf("start command: %w", err)
 	}
 	pw.Close() // child holds its own copy
+
+	exited := make(chan struct{})
+	var cancelled atomic.Bool
+	killerDone := make(chan struct{})
+	go func() {
+		defer close(killerDone)
+		select {
+		case <-exited:
+			return
+		case <-ctx.Done():
+		}
+		cancelled.Store(true)
+		pgid := cmd.Process.Pid
+		_ = signalGroup(pgid, syscall.SIGTERM)
+		deadline := time.NewTimer(KillGrace)
+		defer deadline.Stop()
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-deadline.C:
+				_ = signalGroup(pgid, syscall.SIGKILL)
+				return
+			case <-tick.C:
+				// Stop as soon as every process of the group is gone (the
+				// leader may already be reaped while children linger).
+				if !groupAlive(pgid) {
+					return
+				}
+			}
+		}
+	}()
 
 	ch := make(chan OutputLine, 64)
 	go func() {
@@ -306,17 +365,50 @@ func (e *Executor) Execute(ctx context.Context, req *CommandRequest) (<-chan Out
 			_, _ = io.Copy(io.Discard, pr)
 		}
 
+		waitErr := cmd.Wait()
+		close(exited)
+		<-killerDone // a cancel in progress finishes (group reaped/killed) first
+
 		exitCode := 0
-		if err := cmd.Wait(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
+		if waitErr != nil {
+			if exitErr, ok := waitErr.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else {
 				exitCode = 1
 			}
 		}
+		if cancelled.Load() {
+			ch <- OutputLine{ExitCode: protocol.ExitCancelled, Done: true, Cancelled: true}
+			return
+		}
 		ch <- OutputLine{ExitCode: exitCode, Done: true}
 	}()
 	return ch, nil
+}
+
+// mergeEnv returns env with every key in override replaced (existing
+// entries for those keys are dropped, then the overrides are appended).
+func mergeEnv(env []string, override map[string]string) []string {
+	if len(override) == 0 {
+		return env
+	}
+	out := env[:0:0]
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := override[k]; ok {
+			continue
+		}
+		out = append(out, kv)
+	}
+	keys := make([]string, 0, len(override))
+	for k := range override {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+override[k])
+	}
+	return out
 }
 
 // ParseCommandRequest decodes a JSON command request.

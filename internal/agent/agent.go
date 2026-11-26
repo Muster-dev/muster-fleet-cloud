@@ -42,6 +42,25 @@ type Agent struct {
 
 	sem    chan struct{}
 	replay *replayCache
+	trust  *TrustStore
+
+	mu sync.Mutex
+	// sessions maps a CLI connection name to what the relay told us about
+	// it (SESSION_INFO). Cleared on every relay (re)connect: the relay
+	// re-sends SESSION_INFO to a new connection.
+	sessions map[string]protocol.SessionInfo
+	// running tracks in-flight commands so COMMAND_CANCEL / SESSION_CLOSED
+	// can stop them.
+	running map[runKey]*runningCmd
+}
+
+type runKey struct {
+	cli   string
+	reqID [16]byte
+}
+
+type runningCmd struct {
+	cancel context.CancelFunc
 }
 
 // Options configures an Agent.
@@ -60,6 +79,9 @@ func New(cfg *config.AgentConfig, keys *crypto.KeyPair, opts Options) (*Agent, e
 	}
 	if opts.Version == "" {
 		opts.Version = "dev"
+	}
+	if !config.ValidCLIKeyPolicy(cfg.CLIKeyPolicy) {
+		return nil, fmt.Errorf("invalid cli_key_policy %q (tofu, strict or off)", cfg.CLIKeyPolicy)
 	}
 	client, err := tunnel.NewClient(cfg.Relay.URL, cfg.Relay.Token, tunnel.Options{
 		ClientType: protocol.ClientAgent,
@@ -85,10 +107,23 @@ func New(cfg *config.AgentConfig, keys *crypto.KeyPair, opts Options) (*Agent, e
 			AllowShell:      cfg.AllowShell,
 			AllowPush:       cfg.Project.Mode == "push",
 		}),
-		sem:    make(chan struct{}, MaxConcurrentCommands),
-		replay: newReplayCache(2 * MaxClockSkew),
+		sem:      make(chan struct{}, MaxConcurrentCommands),
+		replay:   newReplayCache(2 * MaxClockSkew),
+		trust:    NewTrustStore(trustPath(opts.ConfigPath)),
+		sessions: make(map[string]protocol.SessionInfo),
+		running:  make(map[runKey]*runningCmd),
 	}, nil
 }
+
+func trustPath(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	return config.TrustedCLIsPath(configPath)
+}
+
+// Trust returns the agent's CLI key trust store.
+func (a *Agent) Trust() *TrustStore { return a.trust }
 
 // Run starts the agent with automatic reconnection. It returns when ctx is
 // cancelled or the relay permanently rejects the credential (revoked).
@@ -163,16 +198,40 @@ func (a *Agent) onAuth(resp *protocol.AuthResponse) error {
 	return nil
 }
 
-func (a *Agent) register() error {
+// Hello builds the AGENT_HELLO payload.
+func (a *Agent) Hello() protocol.AgentHello {
 	host, _ := os.Hostname()
-	hello, err := json.Marshal(protocol.AgentHello{
-		AgentName: a.client.Identity(),
-		Version:   a.version,
-		PublicKey: a.keys.PublicKeyBase64(),
-		Hostname:  host,
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-	})
+	mode := a.cfg.Project.Mode
+	if mode == "" {
+		mode = "muster"
+	}
+	projectDir := false
+	if a.cfg.Project.Dir != "" {
+		if st, err := os.Stat(a.cfg.Project.Dir); err == nil && st.IsDir() {
+			projectDir = true
+		}
+	}
+	features := []string{protocol.FeatureCancel, protocol.FeatureCallerEnv}
+	if a.cfg.CLIKeyPolicy != config.CLIKeyPolicyOff {
+		features = append(features, protocol.FeatureCLIKeyPinning)
+	}
+	return protocol.AgentHello{
+		AgentName:       a.client.Identity(),
+		Version:         a.version,
+		PublicKey:       a.keys.PublicKeyBase64(),
+		Hostname:        host,
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		Mode:            mode,
+		ProjectDir:      projectDir,
+		AllowedCommands: append([]string(nil), a.cfg.AllowedCommands...),
+		AllowShell:      a.cfg.AllowShell,
+		Features:        features,
+	}
+}
+
+func (a *Agent) register() error {
+	hello, err := json.Marshal(a.Hello())
 	if err != nil {
 		return err
 	}
@@ -193,6 +252,9 @@ func (a *Agent) register() error {
 }
 
 func (a *Agent) session(ctx context.Context) error {
+	a.mu.Lock()
+	a.sessions = make(map[string]protocol.SessionInfo)
+	a.mu.Unlock()
 	if err := a.register(); err != nil {
 		return err
 	}
@@ -236,7 +298,38 @@ func (a *Agent) messageLoop(ctx, runCtx context.Context) error {
 			// keepalive response
 
 		case protocol.MsgCommand:
-			go a.handleCommand(runCtx, frame)
+			a.startCommand(runCtx, src, frame)
+
+		case protocol.MsgCommandCancel:
+			if a.cancelCommand(runKey{src, frame.RequestID}) {
+				a.logf("command from %s cancelled by the CLI", src)
+			}
+
+		case protocol.MsgSessionInfo:
+			if src != protocol.RelayID {
+				continue // only the relay may describe sessions
+			}
+			var si protocol.SessionInfo
+			if err := json.Unmarshal(frame.Payload, &si); err != nil || si.CLI == "" {
+				a.logf("malformed SESSION_INFO ignored")
+				continue
+			}
+			si.TokenName = cleanLabel(si.TokenName)
+			a.mu.Lock()
+			a.sessions[si.CLI] = si
+			a.mu.Unlock()
+
+		case protocol.MsgSessionClosed:
+			if src != protocol.RelayID {
+				continue
+			}
+			var sc protocol.SessionClosed
+			if err := json.Unmarshal(frame.Payload, &sc); err != nil || sc.CLI == "" {
+				continue
+			}
+			if n := a.closeSession(sc.CLI); n > 0 {
+				a.logf("CLI %s disconnected: cancelled %d running command(s)", sc.CLI, n)
+			}
 
 		case protocol.MsgKeyExchange:
 			a.handleKeyExchange(frame)
@@ -288,7 +381,110 @@ func (r *responder) fail(code, msg string) {
 	r.send(protocol.MsgCommandError, 0, protocol.ErrorPayload{Code: code, Message: msg})
 }
 
-func (a *Agent) handleCommand(ctx context.Context, frame *protocol.Frame) {
+// startCommand registers a COMMAND under (CLI, request ID) before handing it
+// to a goroutine, so a COMMAND_CANCEL that follows immediately finds it.
+func (a *Agent) startCommand(runCtx context.Context, src string, frame *protocol.Frame) {
+	k := runKey{src, frame.RequestID}
+	ctx, cancel := context.WithCancel(runCtx)
+	a.mu.Lock()
+	if _, dup := a.running[k]; dup {
+		a.mu.Unlock()
+		cancel()
+		r := &responder{a: a, reqID: frame.RequestID, dest: src}
+		r.fail(protocol.ErrCommandRejected, "duplicate request ID")
+		return
+	}
+	rc := &runningCmd{cancel: cancel}
+	a.running[k] = rc
+	info, known := a.sessions[src]
+	a.mu.Unlock()
+	if !known {
+		info = protocol.SessionInfo{CLI: src}
+	}
+	go func() {
+		defer func() {
+			cancel()
+			a.mu.Lock()
+			if a.running[k] == rc {
+				delete(a.running, k)
+			}
+			a.mu.Unlock()
+		}()
+		a.handleCommand(ctx, frame, info)
+	}()
+}
+
+// cancelCommand cancels one running command. It reports whether one was found.
+func (a *Agent) cancelCommand(k runKey) bool {
+	a.mu.Lock()
+	rc, ok := a.running[k]
+	a.mu.Unlock()
+	if ok {
+		rc.cancel()
+	}
+	return ok
+}
+
+// closeSession forgets a CLI session and cancels all its running commands.
+func (a *Agent) closeSession(cli string) int {
+	a.mu.Lock()
+	delete(a.sessions, cli)
+	var victims []*runningCmd
+	for k, rc := range a.running {
+		if k.cli == cli {
+			victims = append(victims, rc)
+		}
+	}
+	a.mu.Unlock()
+	for _, rc := range victims {
+		rc.cancel()
+	}
+	return len(victims)
+}
+
+// RunningCount returns the number of in-flight commands.
+func (a *Agent) RunningCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.running)
+}
+
+// CallerEnv returns the agent-controlled environment for a command from the
+// CLI session described by info. Values come from the relay's SESSION_INFO,
+// never from the command itself.
+func CallerEnv(info protocol.SessionInfo) map[string]string {
+	env := map[string]string{
+		protocol.EnvViaAgent:     "1",
+		protocol.EnvCloudCaller:  info.TokenName,
+		protocol.EnvCallerID:     info.TokenID,
+		protocol.EnvDeploySource: "cloud",
+	}
+	if info.TokenName != "" {
+		env[protocol.EnvDeploySource] = "cloud:" + info.TokenName
+	} else if info.TokenID != "" {
+		env[protocol.EnvCloudCaller] = info.TokenID
+		env[protocol.EnvDeploySource] = "cloud:" + info.TokenID
+	}
+	return env
+}
+
+// cleanLabel keeps a relay-supplied display name printable and short.
+func cleanLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	return out
+}
+
+func (a *Agent) handleCommand(ctx context.Context, frame *protocol.Frame, info protocol.SessionInfo) {
 	r := &responder{a: a, reqID: frame.RequestID, dest: protocol.ParseID(frame.SourceID)}
 
 	var plaintext []byte
@@ -328,6 +524,20 @@ func (a *Agent) handleCommand(ctx context.Context, frame *protocol.Frame) {
 		}
 	}
 
+	if r.peer != nil {
+		switch d, err := a.trust.Check(a.cfg.CLIKeyPolicy, info.TokenID, info.TokenName, *r.peer, req.PersistentKey); {
+		case err != nil:
+			a.logf("command from %s rejected: %v", r.dest, err)
+			r.fail(protocol.ErrCommandRejected, err.Error())
+			return
+		case d == TrustPinned:
+			a.logf("pinned CLI key %s for token %s (%s)", crypto.Fingerprint(*r.peer), info.TokenID, info.TokenName)
+		}
+	} else if a.cfg.CLIKeyPolicy == config.CLIKeyPolicyStrict {
+		r.fail(protocol.ErrCommandRejected, "plaintext commands are not allowed with cli_key_policy strict")
+		return
+	}
+
 	select {
 	case a.sem <- struct{}{}:
 		defer func() { <-a.sem }()
@@ -336,18 +546,31 @@ func (a *Agent) handleCommand(ctx context.Context, frame *protocol.Frame) {
 		return
 	}
 
-	outputCh, err := a.executor.Execute(ctx, req)
+	outputCh, err := a.executor.Execute(ctx, req, CallerEnv(info))
+	if errors.Is(err, context.Canceled) {
+		r.send(protocol.MsgCommandResult, 0, protocol.CommandResult{ExitCode: protocol.ExitCancelled, Status: protocol.StatusCancelled})
+		return
+	}
 	if err != nil {
 		a.logf("command from %s rejected: %v", r.dest, err)
 		r.fail(protocol.ErrCommandRejected, err.Error())
 		return
 	}
-	a.logf("running %s command for %s", req.Action, r.dest)
+	caller := info.TokenName
+	if caller == "" {
+		caller = "unknown caller"
+	}
+	a.logf("running %s command for %s (%s)", req.Action, r.dest, caller)
 	r.send(protocol.MsgCommandAck, 0, nil)
 
 	for line := range outputCh {
 		if line.Done {
-			r.send(protocol.MsgCommandResult, 0, protocol.CommandResult{ExitCode: line.ExitCode, Status: "done"})
+			res := protocol.CommandResult{ExitCode: line.ExitCode, Status: protocol.StatusDone}
+			if line.Cancelled {
+				res.Status = protocol.StatusCancelled
+				a.logf("command for %s stopped (process group terminated), exit %d", r.dest, line.ExitCode)
+			}
+			r.send(protocol.MsgCommandResult, 0, res)
 			continue
 		}
 		r.send(protocol.MsgStreamData, protocol.FlagStreamContinued, protocol.StreamLine{Line: line.Text, Stream: line.Stream})
