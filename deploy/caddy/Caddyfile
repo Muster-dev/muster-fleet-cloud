@@ -1,11 +1,57 @@
-# Muster Cloud Relay — Caddy reverse proxy
+# Muster Fleet Cloud relay — Caddy reverse proxy for relay.getmuster.dev
 #
-# Caddy handles automatic HTTPS via Let's Encrypt.
-# Replace relay.example.com with your domain.
+# Topology:  client ──TLS──> Cloudflare (proxied DNS) ──TLS──> Caddy :443 ──> muster-cloud 127.0.0.1:8443
+#
+# The relay must know the real client IP for its per-IP rate limits. Caddy
+# resolves it from CF-Connecting-IP — but ONLY when the request really comes
+# from a Cloudflare edge IP (trusted_proxies) — and passes it on as X-Real-IP.
+# Run the relay with: MUSTER_CLOUD_CLIENT_IP_HEADER=X-Real-IP (the systemd unit
+# in muster-cloud does this) and keep it listening on 127.0.0.1 only.
+#
+# Not behind Cloudflare? Delete the `servers` block; {client_ip} is then the
+# TCP peer address.
 #
 # Usage:
-#   caddy run --config /path/to/Caddyfile
+#   sudo cp Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 
-relay.example.com {
-	reverse_proxy localhost:8443
+{
+	servers {
+		# Cloudflare edge ranges — refresh from https://www.cloudflare.com/ips/
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers CF-Connecting-IP
+		trusted_proxies_strict
+	}
+}
+
+relay.getmuster.dev {
+	# Security headers (the relay serves only JSON + WebSocket).
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+
+	# API bodies are tiny; WebSocket frames are capped by the relay itself.
+	request_body {
+		max_size 64KB
+	}
+
+	# Only the relay's real routes are proxied.
+	@relay path /v1/tunnel /healthz /api/v1/*
+	handle @relay {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Real-IP {client_ip}
+			# Keep long-lived agent WebSockets open across Caddy config reloads.
+			stream_close_delay 5m
+		}
+	}
+	handle {
+		respond 404
+	}
+
+	# Caddy redacts Authorization/Cookie headers in access logs by default;
+	# don't enable `log_credentials`. Tokens are never sent in URLs.
+	log {
+		output file /var/log/caddy/relay.getmuster.dev.log
+	}
 }

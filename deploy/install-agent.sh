@@ -3,9 +3,9 @@
 # Requires root. Tested on Ubuntu 20.04+, Debian 11+.
 #
 # Usage:
-#   sudo ./install-agent.sh                         # install from local build
-#   sudo ./install-agent.sh --binary /path/to/bin   # use a specific binary
-#   sudo ./install-agent.sh --config /path/to/json  # copy config into place
+#   sudo ./install-agent.sh --token mst_agent_... --name prod-1 --project /opt/app
+#   sudo ./install-agent.sh --binary /path/to/bin --token mst_agent_...
+#   sudo ./install-agent.sh --config /path/to/json  # copy an existing (enrolled) config
 set -euo pipefail
 
 die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
@@ -14,16 +14,32 @@ info() { printf '==> %s\n' "$1"; }
 BINARY=""
 CONFIG=""
 SERVICE_FILE=""
+JOIN_TOKEN="${MUSTER_AGENT_JOIN_TOKEN:-}"
+RELAY="wss://relay.getmuster.dev"
+NAME=""
+PROJECT=""
+MODE="muster"
+AGENT_CONFIG="/var/lib/muster/agent/config.json"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --binary)  BINARY="$2";       shift 2 ;;
     --config)  CONFIG="$2";       shift 2 ;;
     --service) SERVICE_FILE="$2"; shift 2 ;;
+    --token)   JOIN_TOKEN="$2";   shift 2 ;;
+    --relay)   RELAY="$2";        shift 2 ;;
+    --name)    NAME="$2";         shift 2 ;;
+    --project) PROJECT="$2";      shift 2 ;;
+    --mode)    MODE="$2";         shift 2 ;;
     -h|--help)
-      printf 'Usage: %s [--binary PATH] [--config PATH] [--service PATH]\n' "$0"
-      printf '\n  --binary   Path to muster-agent binary (default: ./muster-agent)\n'
-      printf '  --config   Path to agent.json to install (copies to /etc/muster/agent.json)\n'
+      printf 'Usage: %s [--token mst_agent_...] [--relay URL] [--name NAME] [--project DIR] [--mode muster|push]\n' "$0"
+      printf '          [--binary PATH] [--config PATH] [--service PATH]\n'
+      printf '\n  --token    One-time join token; enrolls the agent (env MUSTER_AGENT_JOIN_TOKEN)\n'
+      printf '  --relay    Relay URL (default: wss://relay.getmuster.dev)\n'
+      printf '  --name     Agent name (default: join token machine name or hostname)\n'
+      printf '  --project  Project directory on this machine\n'
+      printf '  --binary   Path to muster-agent binary (default: ./muster-agent)\n'
+      printf '  --config   Existing enrolled config to install (instead of --token)\n'
       printf '  --service  Path to systemd unit file (default: deploy/muster-agent.service)\n'
       exit 0 ;;
     *) die "Unknown flag: $1" ;;
@@ -65,21 +81,29 @@ fi
 
 # --- create directories -----------------------------------------------------
 info "Creating directories..."
-install -d -m 0755 -o muster -g muster /var/lib/muster
+install -d -m 0750 -o muster -g muster /var/lib/muster
+install -d -m 0700 -o muster -g muster /var/lib/muster/agent
 install -d -m 0755 /etc/muster
 
 # --- install binary ---------------------------------------------------------
 info "Installing binary to /usr/local/bin/muster-agent..."
 install -m 0755 "$BINARY" /usr/local/bin/muster-agent
 
-# --- install config (if provided) -------------------------------------------
-if [[ -n "$CONFIG" ]]; then
+# --- enroll / install config -------------------------------------------------
+if [[ -n "$JOIN_TOKEN" ]]; then
+  info "Enrolling with relay ${RELAY}..."
+  join_args=(join --config "$AGENT_CONFIG" --relay "$RELAY" --token "$JOIN_TOKEN" --mode "$MODE")
+  [[ -n "$NAME" ]] && join_args+=(--name "$NAME")
+  [[ -n "$PROJECT" ]] && join_args+=(--project "$PROJECT")
+  # Run as the service user so the node credential is owned by it (0600).
+  runuser -u muster -- /usr/local/bin/muster-agent "${join_args[@]}" \
+    || die "Enrollment failed (is the join token valid and unused?)"
+elif [[ -n "$CONFIG" ]]; then
   [[ -f "$CONFIG" ]] || die "Config file not found: $CONFIG"
-  info "Installing config to /etc/muster/agent.json..."
-  install -m 0640 -o root -g muster "$CONFIG" /etc/muster/agent.json
-elif [[ ! -f /etc/muster/agent.json ]]; then
-  info "[note] No config installed. Create /etc/muster/agent.json before starting."
-  info "       See deploy/agent.json.example for reference."
+  info "Installing config to ${AGENT_CONFIG}..."
+  install -m 0600 -o muster -g muster "$CONFIG" "$AGENT_CONFIG"
+elif [[ ! -f "$AGENT_CONFIG" ]]; then
+  die "No join token given and no config at ${AGENT_CONFIG}. Pass --token mst_agent_..."
 fi
 
 # --- install systemd service ------------------------------------------------
@@ -102,4 +126,4 @@ info "Useful commands:"
 info "  journalctl -u muster-agent -f      # follow logs"
 info "  systemctl restart muster-agent      # restart"
 info "  systemctl stop muster-agent         # stop"
-info "  cat /etc/muster/agent.json          # view config"
+info "  muster-agent status --config ${AGENT_CONFIG}"

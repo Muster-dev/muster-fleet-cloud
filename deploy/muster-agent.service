@@ -10,21 +10,28 @@ User=muster
 Group=muster
 WorkingDirectory=/var/lib/muster
 
-ExecStart=/usr/local/bin/muster-agent run --config /etc/muster/agent.json
-Restart=always
-RestartSec=5
+# The config holds the agent's node credential (mst_node_..., mode 0600) and
+# sits next to its keys/ directory. Enroll first, as the muster user:
+#   sudo -u muster muster-agent join --config /var/lib/muster/agent/config.json \
+#        --token mst_agent_... --name prod-1 --project /opt/app
+ExecStart=/usr/local/bin/muster-agent run --config /var/lib/muster/agent/config.json
+# A revoked credential makes the agent exit with status 1; don't hammer the relay.
+Restart=on-failure
+RestartSec=10
 
 # Optional environment overrides
 EnvironmentFile=-/etc/muster/agent.env
 
-# Security hardening
-ProtectSystem=full
+# Hardening. Deploy hooks still need to reach docker/kubectl and the project
+# directory, so this is deliberately less strict than the relay's unit; add
+# your project directory to ReadWritePaths if muster writes into it.
 NoNewPrivileges=true
-PrivateTmp=true
+ProtectSystem=full
 ProtectHome=read-only
+PrivateTmp=true
 ReadWritePaths=/var/lib/muster
+UMask=0077
 
-# Logging — stdout/stderr go to journald
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=muster-agent

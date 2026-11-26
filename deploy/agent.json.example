@@ -1,10 +1,10 @@
 {
   "relay": {
-    "url": "wss://your-relay-server.example.com:8443",
-    "token": "your-agent-token-here"
+    "url": "wss://relay.getmuster.dev",
+    "token": "mst_node_... (written by `muster-agent join`; never edit by hand)"
   },
   "identity": {
-    "org_id": "your-org-id",
+    "org_id": "org_...",
     "name": "prod-server-01"
   },
   "project": {
@@ -18,7 +18,8 @@
     "muster rollback",
     "muster logs"
   ],
-  "log_file": "/var/lib/muster/agent.log",
+  "allow_shell": false,
+  "allow_plaintext": false,
   "reconnect_base_delay": "1s",
   "reconnect_max_delay": "60s"
 }
