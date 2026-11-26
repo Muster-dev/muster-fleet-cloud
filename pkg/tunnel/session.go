@@ -22,16 +22,30 @@ func (e *RemoteError) Error() string { return e.Code + ": " + e.Message }
 // a fresh ephemeral X25519 keypair; command payloads are end-to-end
 // encrypted to the agent's public key so the relay cannot read them.
 type Session struct {
-	c    *Client
-	keys *crypto.KeyPair
-	auth *protocol.AuthResponse
+	c          *Client
+	keys       *crypto.KeyPair
+	persistent bool
+	auth       *protocol.AuthResponse
+
+	// CancelGrace is how long Exec keeps reading after it sent
+	// COMMAND_CANCEL, waiting for the agent's final COMMAND_RESULT
+	// (default DefaultCancelGrace).
+	CancelGrace time.Duration
 }
+
+// DefaultCancelGrace covers the agent's SIGTERM→SIGKILL window (3 s) plus
+// a round trip.
+const DefaultCancelGrace = 5 * time.Second
 
 // SessionOptions configures DialSession.
 type SessionOptions struct {
 	OrgID   string // optional org check
 	Version string
 	Logf    func(string, ...any)
+	// Keys is the CLI's long-lived identity keypair (config.CLIKeyDir).
+	// Agents pin it per CLI token. nil uses a fresh per-session keypair
+	// (v0.3 behaviour; agents cannot pin it).
+	Keys *crypto.KeyPair
 }
 
 // DialSession connects to the relay and authenticates with a CLI token.
@@ -48,9 +62,11 @@ func DialSession(ctx context.Context, relayURL, token string, opts SessionOption
 	if err != nil {
 		return nil, err
 	}
-	keys, err := crypto.GenerateKeyPair()
-	if err != nil {
-		return nil, err
+	keys, persistent := opts.Keys, opts.Keys != nil
+	if keys == nil {
+		if keys, err = crypto.GenerateKeyPair(); err != nil {
+			return nil, err
+		}
 	}
 	dctx, cancel := context.WithTimeout(ctx, DefaultDialTimeout)
 	defer cancel()
@@ -62,7 +78,7 @@ func DialSession(ctx context.Context, relayURL, token string, opts SessionOption
 		c.Close()
 		return nil, err
 	}
-	return &Session{c: c, keys: keys, auth: auth}, nil
+	return &Session{c: c, keys: keys, persistent: persistent, auth: auth, CancelGrace: DefaultCancelGrace}, nil
 }
 
 // Close closes the session.
@@ -70,6 +86,9 @@ func (s *Session) Close() error { return s.c.Close() }
 
 // OrgID returns the authenticated org.
 func (s *Session) OrgID() string { return s.auth.OrgID }
+
+// PublicKey returns the key commands are sealed with.
+func (s *Session) PublicKey() [32]byte { return s.keys.PublicKey }
 
 // Name returns the relay-assigned connection name.
 func (s *Session) Name() string { return s.auth.Name }
@@ -160,8 +179,14 @@ func (s *Session) ListAgents(ctx context.Context) (json.RawMessage, error) {
 // Exec sends an encrypted COMMAND to agent and streams output lines to out
 // until COMMAND_RESULT. Replies must be encrypted by agentPub; anything else
 // is rejected.
+//
+// If ctx is cancelled while the command runs, Exec sends COMMAND_CANCEL
+// (same request ID), keeps streaming for up to CancelGrace while the agent
+// stops the command, and returns protocol.ExitCancelled with ctx.Err(). The
+// session must not be reused after a cancelled Exec.
 func (s *Session) Exec(ctx context.Context, agent string, agentPub [32]byte, req protocol.CommandRequest, out func(protocol.StreamLine)) (int, error) {
 	req.Timestamp = time.Now().Unix()
+	req.PersistentKey = s.persistent
 	plain, err := json.Marshal(req)
 	if err != nil {
 		return 0, err
@@ -170,9 +195,10 @@ func (s *Session) Exec(ctx context.Context, agent string, agentPub [32]byte, req
 	if err != nil {
 		return 0, err
 	}
-	f := protocol.NewFrame(protocol.MsgCommand, NewRequestID(), s.Name(), agent, protocol.FlagEncrypted, sealed)
+	reqID := NewRequestID()
+	f := protocol.NewFrame(protocol.MsgCommand, reqID, s.Name(), agent, protocol.FlagEncrypted, sealed)
 
-	hctx, cancel := context.WithCancel(ctx)
+	hctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.c.Heartbeat(hctx, 30*time.Second)
 
@@ -190,45 +216,114 @@ func (s *Session) Exec(ctx context.Context, agent string, agentPub [32]byte, req
 		return pt, nil
 	}
 
-	exitCode := 0
-	err = s.roundTrip(ctx, f, 95*time.Second, func(r *protocol.Frame) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.ExitCancelled, err
+	}
+	if err := s.c.SendFrame(f); err != nil {
+		return 0, err
+	}
+
+	type readResult struct {
+		f   *protocol.Frame
+		err error
+	}
+	// One read at a time, so no read is left in flight after a normal
+	// return (the session stays usable).
+	var pending chan readResult
+	readNext := func() chan readResult {
+		ch := make(chan readResult, 1)
+		go func() {
+			s.c.SetReadTimeout(95 * time.Second)
+			fr, err := s.c.ReadFrame()
+			ch <- readResult{fr, err}
+		}()
+		return ch
+	}
+
+	cancelled := false
+	var grace <-chan time.Time
+	done := ctx.Done()
+	for {
+		if pending == nil {
+			pending = readNext()
+		}
+		var rr readResult
+		select {
+		case <-done:
+			done = nil
+			cancelled = true
+			cf := protocol.NewFrame(protocol.MsgCommandCancel, reqID, s.Name(), agent, 0, nil)
+			if err := s.c.SendFrame(cf); err != nil {
+				return protocol.ExitCancelled, ctx.Err()
+			}
+			g := s.CancelGrace
+			if g <= 0 {
+				g = DefaultCancelGrace
+			}
+			t := time.NewTimer(g)
+			defer t.Stop()
+			grace = t.C
+			continue
+		case <-grace:
+			return protocol.ExitCancelled, ctx.Err()
+		case rr = <-pending:
+			pending = nil
+		}
+		if rr.err != nil {
+			if cancelled {
+				return protocol.ExitCancelled, ctx.Err()
+			}
+			return 0, rr.err
+		}
+		r := rr.f
+		if r.RequestID != reqID {
+			continue
+		}
 		switch r.MsgType {
-		case protocol.MsgCommandAck:
-			return false, nil
+		case protocol.MsgError:
+			if cancelled {
+				// e.g. an older relay refusing COMMAND_CANCEL (E_BAD_FRAME).
+				return protocol.ExitCancelled, ctx.Err()
+			}
+			var ep protocol.ErrorPayload
+			_ = json.Unmarshal(r.Payload, &ep)
+			return 0, &RemoteError{Code: ep.Code, Message: ep.Message}
 		case protocol.MsgStreamData:
 			pt, err := open(r)
 			if err != nil {
-				return true, err
+				return 0, err
 			}
 			var line protocol.StreamLine
 			if err := json.Unmarshal(pt, &line); err == nil && out != nil {
 				out(line)
 			}
-			return false, nil
 		case protocol.MsgCommandResult:
 			pt, err := open(r)
 			if err != nil {
-				return true, err
+				return 0, err
 			}
 			var res protocol.CommandResult
 			if err := json.Unmarshal(pt, &res); err != nil {
-				return true, fmt.Errorf("parse COMMAND_RESULT: %w", err)
+				return 0, fmt.Errorf("parse COMMAND_RESULT: %w", err)
 			}
-			exitCode = res.ExitCode
-			return true, nil
+			if cancelled {
+				return protocol.ExitCancelled, ctx.Err()
+			}
+			return res.ExitCode, nil
 		case protocol.MsgCommandError:
 			var ep protocol.ErrorPayload
 			pt := r.Payload
 			if r.IsEncrypted() {
 				var err error
 				if pt, err = open(r); err != nil {
-					return true, err
+					return 0, err
 				}
 			}
 			_ = json.Unmarshal(pt, &ep)
-			return true, &RemoteError{Code: ep.Code, Message: ep.Message}
+			if cancelled {
+				return protocol.ExitCancelled, ctx.Err()
+			}
+			return 0, &RemoteError{Code: ep.Code, Message: ep.Message}
 		}
-		return false, nil
-	})
-	return exitCode, err
+	}
 }

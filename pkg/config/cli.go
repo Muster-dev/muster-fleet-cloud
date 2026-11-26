@@ -64,6 +64,16 @@ func SaveCLIConfig(path string, cfg *CLIConfig) error {
 	return WriteFileAtomic(path, append(data, '\n'), 0600)
 }
 
+// CLIKeyDir returns the directory holding the CLI's long-lived X25519
+// identity key ($MUSTER_CLOUD_KEY_DIR, or ~/.muster/cloud_keys). Agents pin
+// this key per CLI token.
+func CLIKeyDir() string {
+	if d := os.Getenv("MUSTER_CLOUD_KEY_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(MusterHome(), "cloud_keys")
+}
+
 // KnownAgentsPath returns the file holding pinned agent public keys
 // (~/.muster/cloud_known_agents.json).
 func KnownAgentsPath() string {

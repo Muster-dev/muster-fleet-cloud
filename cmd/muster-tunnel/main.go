@@ -32,6 +32,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		// After the first SIGINT/SIGTERM (which cancels ctx: exec/push send
+		// COMMAND_CANCEL and wait briefly), restore default handling so a
+		// second signal kills the process immediately.
+		<-ctx.Done()
+		stop()
+	}()
 
 	args := os.Args[2:]
 	var err error
@@ -63,6 +70,9 @@ func main() {
 		var ee exitError
 		if errors.As(err, &ee) {
 			os.Exit(int(ee))
+		}
+		if errors.Is(err, context.Canceled) {
+			os.Exit(protocol.ExitCancelled)
 		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -100,8 +110,15 @@ func printUsage() {
 	fmt.Println("Exec/Push flags:")
 	fmt.Println("  --cmd COMMAND     Command to execute (exec only)")
 	fmt.Println("  --hook FILE       Hook script to push (push only)")
-	fmt.Println("  --env VARS        Env vars as KEY=val,KEY2=val2 (push only)")
+	fmt.Println("  --env KEY=VALUE   Env var for the command; repeatable. For push, a value")
+	fmt.Println("                    may also be a comma list KEY=val,KEY2=val2 (legacy)")
 	fmt.Println("  --cwd DIR         Working directory on the remote agent (absolute)")
+	fmt.Println()
+	fmt.Println("Ctrl+C / SIGTERM during exec or push asks the agent to stop the command")
+	fmt.Println("(its whole process group) and exits 130. A second Ctrl+C exits at once.")
+	fmt.Println()
+	fmt.Println("Commands are sealed with a long-lived CLI key (~/.muster/cloud_keys, env")
+	fmt.Println("MUSTER_CLOUD_KEY_DIR) that agents pin per CLI token; 'whoami' prints it.")
 }
 
 type common struct {
@@ -160,7 +177,11 @@ func (c *common) dial(ctx context.Context) (*tunnel.Session, error) {
 	if err := c.resolve(true); err != nil {
 		return nil, err
 	}
-	s, err := tunnel.DialSession(ctx, c.relay, c.token, tunnel.SessionOptions{OrgID: c.org, Version: version})
+	keys, err := crypto.LoadOrCreateKeyPair(config.CLIKeyDir())
+	if err != nil {
+		return nil, fmt.Errorf("CLI identity key: %w", err)
+	}
+	s, err := tunnel.DialSession(ctx, c.relay, c.token, tunnel.SessionOptions{OrgID: c.org, Version: version, Keys: keys})
 	if err != nil {
 		return nil, err
 	}
@@ -208,12 +229,45 @@ func printLine(l protocol.StreamLine) {
 	fmt.Println(l.Line)
 }
 
+// envFlag collects repeatable --env KEY=VALUE flags. With splitCommas (push,
+// for compatibility with v0.3) a value may hold several pairs separated by
+// commas.
+type envFlag struct {
+	vars        map[string]string
+	splitCommas bool
+}
+
+func (e *envFlag) String() string { return "" }
+
+func (e *envFlag) Set(v string) error {
+	if e.vars == nil {
+		e.vars = map[string]string{}
+	}
+	pairs := []string{v}
+	if e.splitCommas {
+		pairs = strings.Split(v, ",")
+	}
+	for _, pair := range pairs {
+		if pair == "" && e.splitCommas {
+			continue
+		}
+		k, val, ok := strings.Cut(pair, "=")
+		if !ok || k == "" {
+			return fmt.Errorf("invalid --env %q (want KEY=VALUE)", pair)
+		}
+		e.vars[k] = val
+	}
+	return nil
+}
+
 func cmdExec(ctx context.Context, args []string) error {
 	var c common
 	var cmd, cwd string
+	var env envFlag
 	fs := newFlagSet("exec", &c)
 	fs.StringVar(&cmd, "cmd", "", "command to execute")
 	fs.StringVar(&cwd, "cwd", "", "working directory on the agent")
+	fs.Var(&env, "env", "env var KEY=VALUE for the command (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return exitError(2)
 	}
@@ -229,22 +283,17 @@ func cmdExec(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "exec", Command: cmd, Cwd: cwd, Stream: true}, printLine)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return exitError(code)
-	}
-	return nil
+	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "exec", Command: cmd, Env: env.vars, Cwd: cwd, Stream: true}, printLine)
+	return execOutcome(code, err)
 }
 
 func cmdPush(ctx context.Context, args []string) error {
 	var c common
-	var hook, envStr, cwd string
+	var hook, cwd string
+	env := envFlag{splitCommas: true}
 	fs := newFlagSet("push", &c)
 	fs.StringVar(&hook, "hook", "", "hook script to push")
-	fs.StringVar(&envStr, "env", "", "env vars KEY=val,KEY2=val2")
+	fs.Var(&env, "env", "env vars KEY=val (repeatable, or KEY=val,KEY2=val2)")
 	fs.StringVar(&cwd, "cwd", "", "working directory on the agent")
 	if err := fs.Parse(args); err != nil {
 		return exitError(2)
@@ -256,12 +305,6 @@ func cmdPush(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read hook file: %w", err)
 	}
-	env := map[string]string{}
-	for _, pair := range strings.Split(envStr, ",") {
-		if k, v, ok := strings.Cut(pair, "="); ok && k != "" {
-			env[k] = v
-		}
-	}
 	s, err := c.dial(ctx)
 	if err != nil {
 		return err
@@ -271,7 +314,16 @@ func cmdPush(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "push_hook", Command: string(script), Env: env, Cwd: cwd, Stream: true}, printLine)
+	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "push_hook", Command: string(script), Env: env.vars, Cwd: cwd, Stream: true}, printLine)
+	return execOutcome(code, err)
+}
+
+// execOutcome maps an Exec result to the process outcome.
+func execOutcome(code int, err error) error {
+	if errors.Is(err, context.Canceled) {
+		fmt.Fprintln(os.Stderr, "muster-tunnel: cancelled (asked the agent to stop the command)")
+		return exitError(protocol.ExitCancelled)
+	}
 	if err != nil {
 		return err
 	}
@@ -333,6 +385,12 @@ func cmdWhoami(ctx context.Context, args []string) error {
 	}
 	defer s.Close()
 	fmt.Printf("org: %s\nrelay: %s\n", s.OrgID(), c.relay)
+	if cfg, err := config.LoadCLIConfig(c.configPath); err == nil && cfg.TokenID != "" && cfg.Token == c.token {
+		fmt.Printf("token: %s (%s)\n", cfg.TokenID, cfg.Name)
+	}
+	pub := s.PublicKey()
+	fmt.Printf("cli key: %s\n", crypto.Fingerprint(pub))
+	fmt.Printf("cli public key: %s\n", base64.StdEncoding.EncodeToString(pub[:]))
 	return nil
 }
 
