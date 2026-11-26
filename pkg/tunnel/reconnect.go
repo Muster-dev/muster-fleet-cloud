@@ -2,10 +2,11 @@ package tunnel
 
 import (
 	"context"
-	"log"
 	"math"
 	"math/rand"
 	"time"
+
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
 )
 
 // ReconnectConfig controls reconnection behavior.
@@ -24,68 +25,82 @@ func DefaultReconnectConfig() ReconnectConfig {
 	}
 }
 
-// ConnectLoop connects to the relay and reconnects on failure.
-// It calls onConnected each time a connection is established.
-// The loop runs until ctx is cancelled.
-func (c *Client) ConnectLoop(ctx context.Context, cfg ReconnectConfig, onConnected func(ctx context.Context) error) error {
+// ConnectLoop connects to the relay and reconnects on failure until ctx is
+// cancelled.
+//
+// After each successful authentication, onAuth (optional) is called with the
+// relay's response — agents use it to persist a node token issued on
+// enrollment and switch to it via SetToken before any reconnect. Then
+// onConnected runs the session; when it returns the loop reconnects.
+//
+// A rejected credential (*AuthError) is permanent and is returned
+// immediately instead of retrying forever with a token the relay will never
+// accept (e.g. a revoked node token).
+func (c *Client) ConnectLoop(
+	ctx context.Context,
+	cfg ReconnectConfig,
+	onAuth func(*protocol.AuthResponse) error,
+	onConnected func(ctx context.Context) error,
+) error {
 	attempt := 0
 
+	wait := func(reason string, err error) error {
+		delay := backoff(attempt, cfg)
+		c.opts.Logf("%s: %v, reconnecting in %s", reason, err, delay.Round(time.Millisecond))
+		attempt++
+		select {
+		case <-time.After(delay):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	for {
-		err := c.Connect()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		dctx, cancel := context.WithTimeout(ctx, DefaultDialTimeout)
+		err := c.ConnectContext(dctx)
+		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if werr := wait("connection failed", err); werr != nil {
+				return werr
 			}
-			delay := backoff(attempt, cfg)
-			log.Printf("connection failed: %v, reconnecting in %s", err, delay)
-			select {
-			case <-time.After(delay):
-				attempt++
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			continue
 		}
 
-		// Authenticate with relay
-		if err := c.Authenticate(); err != nil {
+		resp, err := c.Authenticate()
+		if err != nil {
 			c.Close()
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if IsAuthError(err) {
+				return err
 			}
-			delay := backoff(attempt, cfg)
-			log.Printf("auth failed: %v, reconnecting in %s", err, delay)
-			select {
-			case <-time.After(delay):
-				attempt++
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
+			if werr := wait("auth failed", err); werr != nil {
+				return werr
+			}
+			continue
+		}
+		if onAuth != nil {
+			if err := onAuth(resp); err != nil {
+				c.Close()
+				return err
 			}
 		}
 
-		// Connection established and authenticated
-		attempt = 0
 		connectedAt := time.Now()
-
-		if err := onConnected(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			// If connection lasted > 60s, reset attempt counter
-			if time.Since(connectedAt) > 60*time.Second {
-				attempt = 0
-			}
-
-			delay := backoff(attempt, cfg)
-			log.Printf("disconnected: %v, reconnecting in %s", err, delay)
-			select {
-			case <-time.After(delay):
-				attempt++
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+		err = onConnected(ctx)
+		c.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A connection that stayed up for a while resets the backoff.
+		if time.Since(connectedAt) > 60*time.Second {
+			attempt = 0
+		}
+		if werr := wait("disconnected", err); werr != nil {
+			return werr
 		}
 	}
 }
