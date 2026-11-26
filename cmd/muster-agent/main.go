@@ -2,22 +2,21 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/Muster-dev/muster-fleet-cloud/internal/agent"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/crypto"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
-	"github.com/Muster-dev/muster-fleet-cloud/pkg/tunnel"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -27,11 +26,11 @@ func main() {
 
 	switch os.Args[1] {
 	case "run":
-		cmdRun()
+		cmdRun(os.Args[2:])
 	case "join":
-		cmdJoin()
+		cmdJoin(os.Args[2:])
 	case "status":
-		cmdStatus()
+		cmdStatus(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("muster-agent %s\n", version)
 	case "--help", "-h", "help":
@@ -44,204 +43,161 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Usage: muster-agent <command>")
+	fmt.Println("Usage: muster-agent <command> [options]")
 	fmt.Println()
 	fmt.Println("Commands:")
+	fmt.Println("  join      Enroll this machine with a relay using a one-time join token")
 	fmt.Println("  run       Start the agent daemon (foreground)")
-	fmt.Println("  join      Register with a relay using a join token")
-	fmt.Println("  status    Show agent connection status")
+	fmt.Println("  status    Show agent configuration")
 	fmt.Println("  version   Print version")
 	fmt.Println()
-	fmt.Println("Run 'muster-agent join --help' for registration options.")
+	fmt.Println("All commands accept --config <path> (default: $MUSTER_AGENT_CONFIG or ~/.muster-agent/config.json).")
+	fmt.Println("Run 'muster-agent join --help' for enrollment options.")
 }
 
-func cmdRun() {
-	cfg, err := config.LoadAgentConfig()
+func cmdRun(args []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	configPath := fs.String("config", config.AgentConfigPath(), "agent config file")
+	_ = fs.Parse(args)
+
+	cfg, err := config.LoadAgentConfigFrom(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		log.Fatalf("load config: %v (run 'muster-agent join' first)", err)
+	}
+	if cfg.Relay.URL == "" || cfg.Relay.Token == "" {
+		log.Fatalf("config %s has no relay url/token; run 'muster-agent join'", *configPath)
 	}
 
-	keyDir := filepath.Join(config.AgentConfigDir(), "keys")
-	keys, err := crypto.LoadKeyPair(keyDir)
+	keys, err := crypto.LoadKeyPair(config.KeyDirFor(*configPath))
 	if err != nil {
 		log.Fatalf("load keys: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// Handle shutdown signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("shutting down...")
-		cancel()
-	}()
-
-	a := agent.New(cfg, keys)
-	if err := a.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatalf("agent error: %v", err)
+	a, err := agent.New(cfg, keys, agent.Options{ConfigPath: *configPath, Version: version})
+	if err != nil {
+		log.Fatalf("agent: %v", err)
 	}
+	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("agent stopped: %v", err)
+	}
+	log.Println("shut down")
 }
 
-func cmdJoin() {
-	// Parse flags
-	var relayURL, token, orgID, name, projectDir, mode, musterPath string
+func cmdJoin(args []string) {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	configPath := fs.String("config", config.AgentConfigPath(), "agent config file to write")
+	relayURL := fs.String("relay", config.DefaultRelayURL, "relay URL (wss://...)")
+	token := fs.String("token", os.Getenv("MUSTER_AGENT_JOIN_TOKEN"), "one-time join token (mst_agent_...; env MUSTER_AGENT_JOIN_TOKEN)")
+	orgID := fs.String("org", "", "organization ID (optional; verified against the token)")
+	name := fs.String("name", "", "agent name (default: the token's machine name, else this host's name)")
+	projectDir := fs.String("project", "", "project directory on this machine")
+	mode := fs.String("mode", "muster", "deploy mode: muster or push")
+	musterPath := fs.String("muster-path", "", "path to the muster binary (default: muster)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: muster-agent join --token mst_agent_... [--relay wss://relay.getmuster.dev] [--name prod-1] [--project /opt/app]")
+		fmt.Fprintln(os.Stderr)
+		fs.PrintDefaults()
+	}
+	_ = fs.Parse(args)
 
-	args := os.Args[2:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--relay":
-			i++
-			if i < len(args) {
-				relayURL = args[i]
-			}
-		case "--token":
-			i++
-			if i < len(args) {
-				token = args[i]
-			}
-		case "--org":
-			i++
-			if i < len(args) {
-				orgID = args[i]
-			}
-		case "--name":
-			i++
-			if i < len(args) {
-				name = args[i]
-			}
-		case "--project":
-			i++
-			if i < len(args) {
-				projectDir = args[i]
-			}
-		case "--mode":
-			i++
-			if i < len(args) {
-				mode = args[i]
-			}
-		case "--muster-path":
-			i++
-			if i < len(args) {
-				musterPath = args[i]
-			}
-		case "--help", "-h":
-			fmt.Println("Usage: muster-agent join --relay <url> --token <join-token> --org <org> --name <name> [options]")
-			fmt.Println()
-			fmt.Println("Options:")
-			fmt.Println("  --relay <url>        Relay WebSocket URL (wss://...)")
-			fmt.Println("  --token <token>      One-time join token")
-			fmt.Println("  --org <org>          Organization ID")
-			fmt.Println("  --name <name>        Agent name (e.g., prod-1)")
-			fmt.Println("  --project <dir>      Project directory on this machine")
-			fmt.Println("  --mode <mode>        Deploy mode: muster or push (default: muster)")
-			fmt.Println("  --muster-path <path> Path to muster binary (default: muster)")
-			return
+	if *token == "" {
+		fmt.Fprintln(os.Stderr, "error: --token is required")
+		fs.Usage()
+		os.Exit(2)
+	}
+	if !agent.IsJoinToken(*token) {
+		fmt.Fprintln(os.Stderr, "error: --token must be a join token (mst_agent_...)")
+		os.Exit(2)
+	}
+	if *mode != "muster" && *mode != "push" {
+		fmt.Fprintln(os.Stderr, "error: --mode must be muster or push")
+		os.Exit(2)
+	}
+	reqName := *name
+	if reqName == "" {
+		host, _ := os.Hostname()
+		reqName = protocol.SanitizeName(host)
+	} else if !protocol.ValidName(reqName) {
+		fmt.Fprintln(os.Stderr, "error: --name must be 1-32 chars of [A-Za-z0-9._-]")
+		os.Exit(2)
+	}
+
+	// Reuse an existing keypair so re-joining keeps the agent's identity key
+	// (CLIs pin it); generate one otherwise.
+	keyDir := config.KeyDirFor(*configPath)
+	keys, err := crypto.LoadKeyPair(keyDir)
+	if err != nil {
+		keys, err = crypto.GenerateKeyPair()
+		if err != nil {
+			log.Fatalf("generate keys: %v", err)
+		}
+		if err := crypto.SaveKeyPair(keyDir, keys); err != nil {
+			log.Fatalf("save keys: %v", err)
 		}
 	}
 
-	if relayURL == "" || token == "" || orgID == "" || name == "" {
-		fmt.Fprintln(os.Stderr, "error: --relay, --token, --org, and --name are required")
-		fmt.Fprintln(os.Stderr, "Run 'muster-agent join --help' for usage.")
-		os.Exit(1)
-	}
-
-	if mode == "" {
-		mode = "muster"
-	}
-
-	// Generate keypair
-	keys, err := crypto.GenerateKeyPair()
-	if err != nil {
-		log.Fatalf("generate keys: %v", err)
-	}
-
-	keyDir := filepath.Join(config.AgentConfigDir(), "keys")
-	if err := crypto.SaveKeyPair(keyDir, keys); err != nil {
-		log.Fatalf("save keys: %v", err)
-	}
-
-	// Connect to relay and register with join token
-	client := tunnel.NewClient(relayURL, token, orgID, name)
-	if err := client.Connect(); err != nil {
-		log.Fatalf("connect to relay: %v", err)
-	}
-	defer client.Close()
-
-	// Authenticate with join token
-	if err := client.Authenticate(); err != nil {
-		log.Fatalf("authenticate: %v", err)
-	}
-
-	// Send AGENT_HELLO with public key
-	hello := map[string]interface{}{
-		"agent_name": name,
-		"org_id":     orgID,
-		"version":    version,
-		"public_key": keys.PublicKeyBase64(),
-	}
-	helloPayload, err := json.Marshal(hello)
-	if err != nil {
-		log.Fatalf("marshal hello: %v", err)
-	}
-
-	var reqID [16]byte
-	helloFrame := protocol.NewFrame(
-		protocol.MsgAgentHello,
-		reqID,
-		client.Identity(),
-		"relay",
-		0,
-		helloPayload,
-	)
-	if err := client.SendFrame(helloFrame); err != nil {
-		log.Fatalf("send AGENT_HELLO: %v", err)
-	}
-
-	// Wait for RELAY_ACK
-	ackFrame, err := client.ReadFrame()
-	if err != nil {
-		log.Fatalf("read RELAY_ACK: %v", err)
-	}
-	if ackFrame.MsgType != protocol.MsgRelayAck {
-		log.Fatalf("expected RELAY_ACK, got %s", protocol.MsgTypeName(ackFrame.MsgType))
-	}
-
-	// Save config (store join token for now -- session token rotation comes later)
 	cfg := config.DefaultAgentConfig()
-	cfg.Relay.URL = relayURL
-	cfg.Relay.Token = token
-	cfg.Identity.OrgID = orgID
-	cfg.Identity.Name = name
-	cfg.Project.Dir = projectDir
-	cfg.Project.Mode = mode
-	if musterPath != "" {
-		cfg.MusterPath = musterPath
+	if existing, err := config.LoadAgentConfigFrom(*configPath); err == nil {
+		cfg = existing // keep allowlist and other local settings
+	}
+	cfg.Relay.URL = *relayURL
+	cfg.Relay.Token = *token
+	cfg.Identity.OrgID = *orgID
+	cfg.Identity.Name = reqName
+	if *projectDir != "" {
+		cfg.Project.Dir = *projectDir
+	}
+	cfg.Project.Mode = *mode
+	if *musterPath != "" {
+		cfg.MusterPath = *musterPath
 	}
 
-	if err := config.SaveAgentConfig(cfg); err != nil {
-		log.Fatalf("save config: %v", err)
+	a, err := agent.New(cfg, keys, agent.Options{ConfigPath: *configPath, Version: version})
+	if err != nil {
+		log.Fatalf("join: %v", err)
+	}
+	resp, err := a.Enroll(context.Background())
+	if err != nil {
+		log.Fatalf("join failed: %v", err)
+	}
+	if resp.NodeToken == "" {
+		log.Fatalf("join failed: relay did not issue a node credential")
 	}
 
-	fmt.Printf("Agent registered: %s/%s\n", orgID, name)
-	fmt.Printf("Config saved to: %s\n", config.AgentConfigPath())
-	fmt.Printf("Public key: %s\n", keys.PublicKeyBase64())
+	fmt.Printf("Agent enrolled: %s (org %s)\n", resp.Name, resp.OrgID)
+	fmt.Printf("Config saved to: %s (node credential, mode 0600)\n", *configPath)
+	fmt.Printf("Public key fingerprint: %s\n", crypto.Fingerprint(keys.PublicKey))
 	fmt.Println()
 	fmt.Println("Start the agent:")
-	fmt.Println("  muster-agent run")
+	fmt.Printf("  muster-agent run --config %s\n", *configPath)
 }
 
-func cmdStatus() {
-	cfg, err := config.LoadAgentConfig()
+func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	configPath := fs.String("config", config.AgentConfigPath(), "agent config file")
+	_ = fs.Parse(args)
+
+	cfg, err := config.LoadAgentConfigFrom(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "No agent config found. Run 'muster-agent join' first.\n")
+		fmt.Fprintf(os.Stderr, "No agent config found at %s. Run 'muster-agent join' first.\n", *configPath)
 		os.Exit(1)
 	}
-
-	fmt.Printf("Agent: %s/%s\n", cfg.Identity.OrgID, cfg.Identity.Name)
-	fmt.Printf("Relay: %s\n", cfg.Relay.URL)
-	fmt.Printf("Project: %s (%s mode)\n", cfg.Project.Dir, cfg.Project.Mode)
-	fmt.Printf("Config: %s\n", config.AgentConfigPath())
+	cred := "none"
+	switch {
+	case agent.IsJoinToken(cfg.Relay.Token):
+		cred = "join token (not yet enrolled)"
+	case cfg.Relay.Token != "":
+		cred = "node credential"
+	}
+	fmt.Printf("Agent:      %s (org %s)\n", cfg.Identity.Name, cfg.Identity.OrgID)
+	fmt.Printf("Relay:      %s\n", cfg.Relay.URL)
+	fmt.Printf("Credential: %s\n", cred)
+	fmt.Printf("Project:    %s (%s mode)\n", cfg.Project.Dir, cfg.Project.Mode)
+	if keys, err := crypto.LoadKeyPair(config.KeyDirFor(*configPath)); err == nil {
+		fmt.Printf("Key:        %s\n", crypto.Fingerprint(keys.PublicKey))
+	}
+	fmt.Printf("Config:     %s\n", *configPath)
 }

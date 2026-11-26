@@ -5,20 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
 )
 
-// CommandRequest represents a decrypted command from the CLI.
-type CommandRequest struct {
-	Action   string            `json:"action"`   // "deploy", "status", "rollback", "logs", "exec"
-	Command  string            `json:"command"`   // raw command (for "exec" action)
-	Services []string          `json:"services,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
-	Cwd      string            `json:"cwd,omitempty"`
-	Stream   bool              `json:"stream"`
-}
+// CommandRequest is the decrypted command from the CLI.
+type CommandRequest = protocol.CommandRequest
 
 // OutputLine represents a single line of command output.
 type OutputLine struct {
@@ -28,149 +26,284 @@ type OutputLine struct {
 	Done     bool   `json:"done,omitempty"`
 }
 
+// ExecutorOptions configures an Executor.
+type ExecutorOptions struct {
+	MusterPath      string
+	AllowedCommands []string
+	DefaultCwd      string
+	// AllowShell runs "exec" commands via `bash -c` without the allowlist.
+	AllowShell bool
+	// AllowPush permits "push_hook" (arbitrary scripts). Enabled for agents
+	// in push mode.
+	AllowPush bool
+}
+
 // Executor runs commands on behalf of the agent.
+//
+// Security model: in the default mode an "exec" command line is split into
+// argv WITHOUT a shell, must not contain shell metacharacters, and its
+// leading words must match an allowlist entry ("muster deploy" allows
+// `muster deploy api` but not `muster deploy; rm -rf /`). The binary is
+// executed directly, so there is no shell to inject into.
 type Executor struct {
-	musterPath      string
-	allowedCommands []string
-	defaultCwd      string
+	opts ExecutorOptions
 }
 
 // NewExecutor creates a command executor.
-func NewExecutor(musterPath string, allowedCommands []string, defaultCwd string) *Executor {
-	return &Executor{
-		musterPath:      musterPath,
-		allowedCommands: allowedCommands,
-		defaultCwd:      defaultCwd,
+func NewExecutor(opts ExecutorOptions) *Executor {
+	if opts.MusterPath == "" {
+		opts.MusterPath = "muster"
 	}
+	return &Executor{opts: opts}
 }
 
-// ValidateCommand checks if a command is allowed.
-func (e *Executor) ValidateCommand(cmd string) error {
-	for _, allowed := range e.allowedCommands {
-		if strings.HasPrefix(cmd, allowed) {
-			return nil
-		}
-	}
-	return fmt.Errorf("command rejected: %q not in allowlist", cmd)
+var (
+	serviceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	envKeyRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+)
+
+// Environment variables a remote caller may never set: they change how the
+// dynamic loader or the shell behaves and turn "set an env var" into "run
+// arbitrary code".
+var blockedEnv = map[string]bool{
+	"PATH": true, "IFS": true, "BASH_ENV": true, "ENV": true, "SHELLOPTS": true,
+	"BASHOPTS": true, "PROMPT_COMMAND": true, "PS4": true, "HOME": true,
+	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "LD_AUDIT": true,
+	"GCONV_PATH": true, "NODE_OPTIONS": true, "PYTHONPATH": true,
+	"PYTHONSTARTUP": true, "PERL5OPT": true, "RUBYOPT": true,
 }
 
-// Execute runs a muster command and streams output line by line.
-func (e *Executor) Execute(ctx context.Context, req *CommandRequest) (<-chan OutputLine, error) {
-	var cmdStr string
-	switch req.Action {
-	case "deploy":
-		cmdStr = e.musterPath + " deploy --json"
-		if len(req.Services) > 0 {
-			cmdStr += " " + strings.Join(req.Services, " ")
+func validateEnv(env map[string]string) error {
+	for k, v := range env {
+		if !envKeyRe.MatchString(k) {
+			return fmt.Errorf("invalid env var name %q", k)
 		}
-	case "status":
-		cmdStr = e.musterPath + " status --json"
-	case "rollback":
-		cmdStr = e.musterPath + " rollback --json"
-		if len(req.Services) > 0 {
-			cmdStr += " " + strings.Join(req.Services, " ")
+		if blockedEnv[k] || strings.HasPrefix(k, "DYLD_") || strings.HasPrefix(k, "LD_") || strings.HasPrefix(k, "BASH_FUNC_") {
+			return fmt.Errorf("env var %q may not be set remotely", k)
 		}
-	case "logs":
-		if len(req.Services) > 0 {
-			cmdStr = e.musterPath + " logs " + req.Services[0]
-		} else {
-			return nil, fmt.Errorf("logs action requires a service name")
+		if strings.ContainsRune(v, 0) {
+			return fmt.Errorf("env var %q contains a NUL byte", k)
 		}
-	case "exec":
-		cmdStr = req.Command
-	default:
-		return nil, fmt.Errorf("unknown action: %s", req.Action)
 	}
+	return nil
+}
 
-	if err := e.ValidateCommand(cmdStr); err != nil {
+func (e *Executor) resolveCwd(reqCwd string) (string, error) {
+	if reqCwd == "" {
+		return e.opts.DefaultCwd, nil
+	}
+	if !filepath.IsAbs(reqCwd) {
+		return "", fmt.Errorf("cwd must be an absolute path")
+	}
+	return filepath.Clean(reqCwd), nil
+}
+
+// SplitArgs splits a command line into words like a POSIX shell would for
+// quoting purposes ('single', "double", backslash escapes) but performs NO
+// expansion, and rejects unquoted shell metacharacters (; & | < > ` $ ( ) and
+// newlines) so that a command which "looks like" an allowlisted one can never
+// smuggle a second command.
+func SplitArgs(s string) ([]string, error) {
+	var (
+		args    []string
+		cur     strings.Builder
+		inWord  bool
+		inS     bool
+		inD     bool
+		escaped bool
+	)
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+			inWord = true
+		case inS:
+			if r == '\'' {
+				inS = false
+			} else {
+				cur.WriteRune(r)
+			}
+		case inD:
+			switch r {
+			case '"':
+				inD = false
+			case '\\':
+				escaped = true
+			case '`', '$':
+				return nil, fmt.Errorf("shell expansion %q is not allowed", r)
+			default:
+				cur.WriteRune(r)
+			}
+		case r == '\\':
+			escaped = true
+		case r == '\'':
+			inS, inWord = true, true
+		case r == '"':
+			inD, inWord = true, true
+		case r == ' ' || r == '\t':
+			if inWord {
+				args = append(args, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		case strings.ContainsRune(";&|<>`$()\n\r*?[]{}~#!", r):
+			return nil, fmt.Errorf("shell metacharacter %q is not allowed (agent runs commands without a shell)", r)
+		default:
+			cur.WriteRune(r)
+			inWord = true
+		}
+	}
+	if inS || inD || escaped {
+		return nil, fmt.Errorf("unterminated quote or escape")
+	}
+	if inWord {
+		args = append(args, cur.String())
+	}
+	return args, nil
+}
+
+// allowed reports whether argv starts with the words of an allowlist entry.
+func (e *Executor) allowed(argv []string) bool {
+	for _, entry := range e.opts.AllowedCommands {
+		words := strings.Fields(entry)
+		if len(words) == 0 || len(words) > len(argv) {
+			continue
+		}
+		match := true
+		for i, w := range words {
+			if argv[i] != w {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildCommand turns a request into an *exec.Cmd after validation.
+func (e *Executor) BuildCommand(ctx context.Context, req *CommandRequest) (*exec.Cmd, error) {
+	if err := validateEnv(req.Env); err != nil {
 		return nil, err
 	}
-
-	cwd := e.defaultCwd
-	if req.Cwd != "" {
-		cwd = req.Cwd
+	cwd, err := e.resolveCwd(req.Cwd)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range req.Services {
+		if !serviceRe.MatchString(s) {
+			return nil, fmt.Errorf("invalid service name %q", s)
+		}
 	}
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+	var cmd *exec.Cmd
+	switch req.Action {
+	case "push_hook":
+		if !e.opts.AllowPush {
+			return nil, fmt.Errorf("push_hook is disabled (agent is not in push mode)")
+		}
+		cmd = exec.CommandContext(ctx, "bash", "-s")
+		cmd.Stdin = strings.NewReader(req.Command)
+
+	case "exec":
+		if e.opts.AllowShell {
+			cmd = exec.CommandContext(ctx, "bash", "-c", req.Command)
+			break
+		}
+		argv, err := SplitArgs(req.Command)
+		if err != nil {
+			return nil, fmt.Errorf("command rejected: %w", err)
+		}
+		if len(argv) == 0 {
+			return nil, fmt.Errorf("command rejected: empty command")
+		}
+		if !e.allowed(argv) {
+			return nil, fmt.Errorf("command rejected: %q not in allowlist", req.Command)
+		}
+		bin := argv[0]
+		if bin == "muster" {
+			bin = e.opts.MusterPath
+		}
+		cmd = exec.CommandContext(ctx, bin, argv[1:]...)
+
+	case "deploy", "rollback":
+		argv := append([]string{"muster", req.Action, "--json"}, req.Services...)
+		if !e.allowed(argv) {
+			return nil, fmt.Errorf("command rejected: muster %s not in allowlist", req.Action)
+		}
+		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+
+	case "status":
+		argv := []string{"muster", "status", "--json"}
+		if !e.allowed(argv) {
+			return nil, fmt.Errorf("command rejected: muster status not in allowlist")
+		}
+		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+
+	case "logs":
+		if len(req.Services) == 0 {
+			return nil, fmt.Errorf("logs action requires a service name")
+		}
+		argv := []string{"muster", "logs", req.Services[0]}
+		if !e.allowed(argv) {
+			return nil, fmt.Errorf("command rejected: muster logs not in allowlist")
+		}
+		cmd = exec.CommandContext(ctx, e.opts.MusterPath, argv[1:]...)
+
+	default:
+		return nil, fmt.Errorf("unknown action: %q", req.Action)
+	}
+
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-
-	// Build environment
 	cmd.Env = os.Environ()
 	for k, v := range req.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = cmd.Stdout // merge stderr into stdout
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start command: %w", err)
-	}
-
-	ch := make(chan OutputLine, 64)
-	go func() {
-		defer close(ch)
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			ch <- OutputLine{Text: scanner.Text(), Stream: "stdout"}
-		}
-
-		exitCode := 0
-		if err := cmd.Wait(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
-			} else {
-				exitCode = 1
-			}
-		}
-
-		ch <- OutputLine{ExitCode: exitCode, Done: true}
-	}()
-
-	return ch, nil
+	return cmd, nil
 }
 
-// ExecuteHook runs a piped hook script (for push mode).
-func (e *Executor) ExecuteHook(ctx context.Context, script string, env map[string]string, cwd string) (<-chan OutputLine, error) {
-	if cwd == "" {
-		cwd = e.defaultCwd
-	}
-
-	cmd := exec.CommandContext(ctx, "bash", "-s")
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-
-	cmd.Stdin = strings.NewReader(script)
-
-	stdout, err := cmd.StdoutPipe()
+// Execute validates and runs a request, streaming merged stdout/stderr line
+// by line. The final value on the channel has Done=true and the exit code.
+func (e *Executor) Execute(ctx context.Context, req *CommandRequest) (<-chan OutputLine, error) {
+	cmd, err := e.BuildCommand(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return nil, err
 	}
-	cmd.Stderr = cmd.Stdout
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("pipe: %w", err)
+	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start hook: %w", err)
+		pr.Close()
+		pw.Close()
+		return nil, fmt.Errorf("start command: %w", err)
 	}
+	pw.Close() // child holds its own copy
 
 	ch := make(chan OutputLine, 64)
 	go func() {
 		defer close(ch)
+		defer pr.Close()
 
-		scanner := bufio.NewScanner(stdout)
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 64*1024), 256*1024)
 		for scanner.Scan() {
 			ch <- OutputLine{Text: scanner.Text(), Stream: "stdout"}
+		}
+		if scanner.Err() != nil {
+			// e.g. a line longer than the buffer: keep draining so the child
+			// never blocks on a full pipe.
+			ch <- OutputLine{Text: "[muster-agent: output line too long, truncated]", Stream: "stderr"}
+			_, _ = io.Copy(io.Discard, pr)
 		}
 
 		exitCode := 0
@@ -181,10 +314,8 @@ func (e *Executor) ExecuteHook(ctx context.Context, script string, env map[strin
 				exitCode = 1
 			}
 		}
-
 		ch <- OutputLine{ExitCode: exitCode, Done: true}
 	}()
-
 	return ch, nil
 }
 
