@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/Muster-dev/muster-fleet-cloud/internal/agent"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
@@ -31,6 +32,10 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "join":
 		cmdJoin(os.Args[2:])
+	case "pair":
+		os.Exit(cmdPair(os.Args[2:]))
+	case "install-service":
+		os.Exit(cmdInstallService(os.Args[2:]))
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "trust":
@@ -50,14 +55,16 @@ func printUsage() {
 	fmt.Println("Usage: muster-agent <command> [options]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  join      Enroll this machine with a relay using a one-time join token")
-	fmt.Println("  run       Start the agent daemon (foreground)")
-	fmt.Println("  status    Show agent configuration")
-	fmt.Println("  trust     List, add or reset pinned CLI keys (trust list|add|reset)")
-	fmt.Println("  version   Print version")
+	fmt.Println("  pair             Connect this machine to Fleet Cloud with a code / QR (easiest)")
+	fmt.Println("  join             Enroll this machine with a one-time join token (advanced)")
+	fmt.Println("  run              Start the agent daemon (foreground)")
+	fmt.Println("  install-service  Run the agent at boot (systemd / launchd; --user for per-user)")
+	fmt.Println("  status           Show agent configuration (--connected: exit 0 only if online)")
+	fmt.Println("  trust            List, add or reset pinned CLI keys (trust list|add|reset)")
+	fmt.Println("  version          Print version")
 	fmt.Println()
 	fmt.Println("All commands accept --config <path> (default: $MUSTER_AGENT_CONFIG or ~/.muster-agent/config.json).")
-	fmt.Println("Run 'muster-agent join --help' for enrollment options.")
+	fmt.Println("Run 'muster-agent <command> --help' for a command's options.")
 }
 
 func cmdRun(args []string) {
@@ -135,49 +142,12 @@ func cmdJoin(args []string) {
 		os.Exit(2)
 	}
 
-	// Reuse an existing keypair so re-joining keeps the agent's identity key
-	// (CLIs pin it); generate one otherwise.
-	keyDir := config.KeyDirFor(*configPath)
-	keys, err := crypto.LoadKeyPair(keyDir)
-	if err != nil {
-		keys, err = crypto.GenerateKeyPair()
-		if err != nil {
-			log.Fatalf("generate keys: %v", err)
-		}
-		if err := crypto.SaveKeyPair(keyDir, keys); err != nil {
-			log.Fatalf("save keys: %v", err)
-		}
-	}
-
-	cfg := config.DefaultAgentConfig()
-	if existing, err := config.LoadAgentConfigFrom(*configPath); err == nil {
-		cfg = existing // keep allowlist and other local settings
-	}
-	cfg.Relay.URL = *relayURL
-	cfg.Relay.Token = *token
-	cfg.Identity.OrgID = *orgID
-	cfg.Identity.Name = reqName
-	if *projectDir != "" {
-		cfg.Project.Dir = *projectDir
-	}
-	cfg.Project.Mode = *mode
-	if *musterPath != "" {
-		cfg.MusterPath = *musterPath
-	}
-	if *keyPolicy != "" {
-		cfg.CLIKeyPolicy = *keyPolicy
-	}
-
-	a, err := agent.New(cfg, keys, agent.Options{ConfigPath: *configPath, Version: version})
-	if err != nil {
-		log.Fatalf("join: %v", err)
-	}
-	resp, err := a.Enroll(context.Background())
+	resp, keys, err := enroll(enrollParams{
+		configPath: *configPath, relayURL: *relayURL, token: *token, orgID: *orgID, name: reqName,
+		projectDir: *projectDir, mode: *mode, musterPath: *musterPath, keyPolicy: *keyPolicy,
+	})
 	if err != nil {
 		log.Fatalf("join failed: %v", err)
-	}
-	if resp.NodeToken == "" {
-		log.Fatalf("join failed: relay did not issue a node credential")
 	}
 
 	fmt.Printf("Agent enrolled: %s (org %s)\n", resp.Name, resp.OrgID)
@@ -188,16 +158,23 @@ func cmdJoin(args []string) {
 	fmt.Printf("  muster-agent run --config %s\n", *configPath)
 }
 
+// exitNotConnected is status --connected's exit code when the agent is
+// configured but not (recently) connected to the relay.
+const exitNotConnected = 3
+
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	configPath := fs.String("config", config.AgentConfigPath(), "agent config file")
+	connected := fs.Bool("connected", false, "exit 0 only if a running agent is connected to the relay (else 3; 1 if not configured)")
 	_ = fs.Parse(args)
 
 	cfg, err := config.LoadAgentConfigFrom(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "No agent config found at %s. Run 'muster-agent join' first.\n", *configPath)
+		fmt.Fprintf(os.Stderr, "No agent config found at %s. Run 'muster-agent pair' (or 'join') first.\n", *configPath)
 		os.Exit(1)
 	}
+	state, stateErr := agent.ReadState(*configPath)
+	online := stateErr == nil && state.Live(time.Now())
 	cred := "none"
 	switch {
 	case agent.IsJoinToken(cfg.Relay.Token):
@@ -223,6 +200,21 @@ func cmdStatus(args []string) {
 		fmt.Printf("Commands:   %s\n", strings.Join(cfg.AllowedCommands, ", "))
 	}
 	fmt.Printf("Config:     %s\n", *configPath)
+	switch {
+	case online:
+		since := ""
+		if state.ConnectedSince != nil {
+			since = " since " + state.ConnectedSince.Local().Format("2006-01-02 15:04:05")
+		}
+		fmt.Printf("Connection: connected%s (pid %d)\n", since, state.PID)
+	case stateErr == nil && state.Connected:
+		fmt.Printf("Connection: not connected (last heartbeat %s; is the agent running?)\n", state.UpdatedAt.Local().Format("2006-01-02 15:04:05"))
+	default:
+		fmt.Printf("Connection: not connected (start it with 'muster-agent run' or 'muster-agent install-service')\n")
+	}
+	if *connected && !online {
+		os.Exit(exitNotConnected)
+	}
 }
 
 func cmdTrust(args []string) {

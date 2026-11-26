@@ -52,6 +52,9 @@ type Agent struct {
 	// running tracks in-flight commands so COMMAND_CANCEL / SESSION_CLOSED
 	// can stop them.
 	running map[runKey]*runningCmd
+	// connectedSince is when the current relay connection was registered
+	// (for the state file); nil while disconnected.
+	connectedSince *time.Time
 }
 
 type runKey struct {
@@ -259,6 +262,8 @@ func (a *Agent) session(ctx context.Context) error {
 		return err
 	}
 	a.logf("agent %s registered with relay %s", a.client.Identity(), a.client.URLs().WS)
+	a.writeState(true)
+	defer a.writeState(false)
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -294,7 +299,10 @@ func (a *Agent) messageLoop(ctx, runCtx context.Context) error {
 				return err
 			}
 
-		case protocol.MsgHeartbeatAck, protocol.MsgRelayAck:
+		case protocol.MsgHeartbeatAck:
+			a.writeState(true) // keepalive response; refresh the state file
+
+		case protocol.MsgRelayAck:
 			// keepalive response
 
 		case protocol.MsgCommand:

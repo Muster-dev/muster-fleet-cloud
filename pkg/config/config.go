@@ -210,3 +210,10 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	return nil
 }
+
+// AgentStatePath returns the file where a running agent records its relay
+// connection state (agent-state.json next to the config). It holds no
+// secrets; `muster-agent status --connected` reads it.
+func AgentStatePath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), "agent-state.json")
+}

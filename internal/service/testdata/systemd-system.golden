@@ -1,0 +1,22 @@
+# Installed by `muster-agent install-service`. Re-run it after moving the
+# binary or the config; manual edits are overwritten.
+[Unit]
+Description=Muster Fleet Cloud agent
+Documentation=https://github.com/Muster-dev/muster-fleet-cloud
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=deploy
+ExecStart="/usr/local/bin/muster-agent" run --config "/home/deploy/.muster-agent/config.json"
+Restart=on-failure
+RestartSec=10
+Environment="PATH=/home/deploy/.muster/bin:/home/deploy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=-/etc/muster/agent.env
+SyslogIdentifier=muster-agent
+
+[Install]
+WantedBy=multi-user.target
