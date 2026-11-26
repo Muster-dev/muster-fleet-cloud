@@ -1,17 +1,28 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/config"
+	"github.com/Muster-dev/muster-fleet-cloud/pkg/crypto"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/protocol"
 	"github.com/Muster-dev/muster-fleet-cloud/pkg/tunnel"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -19,15 +30,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	args := os.Args[2:]
+	var err error
 	switch os.Args[1] {
+	case "login":
+		err = cmdLogin(ctx, args)
+	case "logout":
+		err = cmdLogout(args)
+	case "whoami":
+		err = cmdWhoami(ctx, args)
 	case "exec":
-		cmdExec()
+		err = cmdExec(ctx, args)
 	case "push":
-		cmdPush()
+		err = cmdPush(ctx, args)
 	case "ping":
-		cmdPing()
+		err = cmdPing(ctx, args)
 	case "agents":
-		cmdAgents()
+		err = cmdAgents(ctx, args)
 	case "version", "--version", "-v":
 		fmt.Printf("muster-tunnel %s\n", version)
 	case "--help", "-h", "help":
@@ -37,479 +59,414 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+	if err != nil {
+		var ee exitError
+		if errors.As(err, &ee) {
+			os.Exit(int(ee))
+		}
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 }
+
+type exitError int
+
+func (e exitError) Error() string { return fmt.Sprintf("exit %d", int(e)) }
 
 func printUsage() {
 	fmt.Println("Usage: muster-tunnel <command> [options]")
 	fmt.Println()
 	fmt.Println("Cloud transport for muster fleet and group deployments.")
-	fmt.Println("Routes commands through a WebSocket relay to remote muster-agents.")
+	fmt.Println("Routes end-to-end encrypted commands through a relay to remote muster-agents.")
 	fmt.Println()
 	fmt.Println("Commands:")
+	fmt.Println("  login    Log in with your browser (device code flow) and save a CLI token")
+	fmt.Println("  logout   Forget the saved CLI token")
+	fmt.Println("  whoami   Show which org the token belongs to")
 	fmt.Println("  exec     Execute a command on a remote agent")
-	fmt.Println("  push     Push a hook script to a remote agent")
+	fmt.Println("  push     Push a hook script to a remote agent (agent must be in push mode)")
 	fmt.Println("  ping     Test connectivity to a remote agent")
-	fmt.Println("  agents   List connected agents in your org")
+	fmt.Println("  agents   List connected agents in your org (JSON)")
 	fmt.Println("  version  Print version")
 	fmt.Println()
 	fmt.Println("Common flags:")
-	fmt.Println("  --relay URL     Relay WebSocket URL (wss://...)")
-	fmt.Println("  --token TOKEN   CLI access token (mst_cli_...)")
-	fmt.Println("  --org ORG       Organization ID")
-	fmt.Println("  --agent NAME    Target agent name")
+	fmt.Println("  --relay URL       Relay URL (env MUSTER_CLOUD_RELAY, config file, default " + config.DefaultRelayURL + ")")
+	fmt.Println("  --token TOKEN     CLI token mst_cli_... (env MUSTER_CLOUD_TOKEN, else config file)")
+	fmt.Println("  --config PATH     Credential file (env MUSTER_CLOUD_CONFIG, default ~/.muster/cloud.json)")
+	fmt.Println("  --org ORG         Optional: fail unless the token belongs to this org")
+	fmt.Println("  --agent NAME      Target agent name")
+	fmt.Println("  --accept-new-key  Accept a changed agent public key (after an agent was re-installed)")
 	fmt.Println()
 	fmt.Println("Exec/Push flags:")
-	fmt.Println("  --cmd COMMAND   Command to execute (exec only)")
-	fmt.Println("  --hook FILE     Hook script to push (push only)")
-	fmt.Println("  --env VARS      Env vars as KEY=val,KEY2=val2 (push only)")
-	fmt.Println("  --cwd DIR       Working directory on the remote agent")
+	fmt.Println("  --cmd COMMAND     Command to execute (exec only)")
+	fmt.Println("  --hook FILE       Hook script to push (push only)")
+	fmt.Println("  --env VARS        Env vars as KEY=val,KEY2=val2 (push only)")
+	fmt.Println("  --cwd DIR         Working directory on the remote agent (absolute)")
 }
 
-// commonFlags parses the standard --relay, --token, --org, --agent flags.
-type commonFlags struct {
-	relay string
-	token string
-	org   string
-	agent string
+type common struct {
+	relay        string
+	token        string
+	configPath   string
+	org          string
+	agent        string
+	acceptNewKey bool
 }
 
-func parseCommonFlags(args []string) (commonFlags, []string) {
-	var f commonFlags
-	var remaining []string
+func newFlagSet(name string, c *common) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.StringVar(&c.relay, "relay", "", "relay URL")
+	fs.StringVar(&c.token, "token", "", "CLI token (mst_cli_...)")
+	fs.StringVar(&c.configPath, "config", config.CLIConfigPath(), "credential file")
+	fs.StringVar(&c.org, "org", "", "expected org ID (optional)")
+	fs.StringVar(&c.agent, "agent", "", "target agent name")
+	fs.BoolVar(&c.acceptNewKey, "accept-new-key", false, "accept a changed agent public key")
+	return fs
+}
 
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--relay":
-			i++
-			if i < len(args) {
-				f.relay = args[i]
-			}
-		case "--token":
-			i++
-			if i < len(args) {
-				f.token = args[i]
-			}
-		case "--org":
-			i++
-			if i < len(args) {
-				f.org = args[i]
-			}
-		case "--agent":
-			i++
-			if i < len(args) {
-				f.agent = args[i]
-			}
-		default:
-			remaining = append(remaining, args[i])
+// resolve fills relay/token from flag > env > config file > default.
+func (c *common) resolve(needToken bool) error {
+	cfg, err := config.LoadCLIConfig(c.configPath)
+	if err != nil {
+		return err
+	}
+	if c.relay == "" {
+		c.relay = os.Getenv("MUSTER_CLOUD_RELAY")
+	}
+	if c.relay == "" {
+		c.relay = cfg.RelayURL
+	}
+	if c.relay == "" {
+		c.relay = config.DefaultRelayURL
+	}
+	if c.token == "" {
+		c.token = os.Getenv("MUSTER_CLOUD_TOKEN")
+	}
+	if c.token == "" {
+		c.token = cfg.Token
+	}
+	if needToken {
+		if c.token == "" {
+			return errors.New("no CLI token: run 'muster-tunnel login', or pass --token / set MUSTER_CLOUD_TOKEN")
+		}
+		if !strings.HasPrefix(c.token, "mst_cli_") {
+			return errors.New("token must be a CLI token (mst_cli_...)")
 		}
 	}
-	return f, remaining
+	return nil
 }
 
-func connectAndAuth(f commonFlags, clientName string) (*tunnel.WSConn, error) {
-	url := f.relay + "/v1/tunnel"
-
-	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+f.token)
-
-	conn, err := tunnel.Dial(url, headers)
+func (c *common) dial(ctx context.Context) (*tunnel.Session, error) {
+	if err := c.resolve(true); err != nil {
+		return nil, err
+	}
+	s, err := tunnel.DialSession(ctx, c.relay, c.token, tunnel.SessionOptions{OrgID: c.org, Version: version})
 	if err != nil {
-		return nil, fmt.Errorf("connect to relay: %w", err)
+		return nil, err
 	}
-
-	// Send AUTH_REQUEST
-	authPayload, _ := json.Marshal(map[string]string{
-		"token":       f.token,
-		"client_type": "cli",
-		"org_id":      f.org,
-		"name":        clientName,
-	})
-
-	var reqID [16]byte
-	frame := protocol.NewFrame(
-		protocol.MsgAuthRequest,
-		reqID,
-		f.org+"/"+clientName,
-		"relay",
-		0,
-		authPayload,
-	)
-
-	if err := conn.Write(protocol.Encode(frame)); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send auth: %w", err)
-	}
-
-	// Read AUTH_RESPONSE
-	data, err := conn.Read()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read auth response: %w", err)
-	}
-
-	respFrame, err := protocol.Decode(data)
-	if err != nil || respFrame.MsgType != protocol.MsgAuthResponse {
-		conn.Close()
-		return nil, fmt.Errorf("invalid auth response")
-	}
-
-	return conn, nil
+	return s, nil
 }
 
-func cmdExec() {
-	flags, remaining := parseCommonFlags(os.Args[2:])
+// agentKey gets the agent's public key and checks it against the pin file
+// (trust on first use).
+func (c *common) agentKey(ctx context.Context, s *tunnel.Session) ([32]byte, error) {
+	pub, err := s.AgentKey(ctx, c.agent)
+	if err != nil {
+		return pub, err
+	}
+	urls, _ := tunnel.NormalizeRelayURL(c.relay)
+	path := config.KnownAgentsPath()
+	known, err := config.LoadKnownAgents(path)
+	if err != nil {
+		return pub, err
+	}
+	key := config.KnownAgentKey(urls.WS, s.OrgID(), c.agent)
+	b64 := base64.StdEncoding.EncodeToString(pub[:])
+	switch pinned, ok := known[key]; {
+	case !ok:
+		fmt.Fprintf(os.Stderr, "muster-tunnel: pinning key for agent %s (%s)\n", c.agent, crypto.Fingerprint(pub))
+	case pinned == b64:
+		return pub, nil
+	case !c.acceptNewKey:
+		old, _ := crypto.DecodePublicKey(pinned)
+		return pub, fmt.Errorf("agent %s public key CHANGED (pinned %s, now %s). If the agent was re-installed, re-run with --accept-new-key; otherwise the relay may be tampering with traffic", c.agent, crypto.Fingerprint(old), crypto.Fingerprint(pub))
+	default:
+		fmt.Fprintf(os.Stderr, "muster-tunnel: replacing pinned key for agent %s (%s)\n", c.agent, crypto.Fingerprint(pub))
+	}
+	known[key] = b64
+	if err := config.SaveKnownAgents(path, known); err != nil {
+		return pub, fmt.Errorf("save pinned key: %w", err)
+	}
+	return pub, nil
+}
 
+func printLine(l protocol.StreamLine) {
+	if l.Stream == "stderr" {
+		fmt.Fprintln(os.Stderr, l.Line)
+		return
+	}
+	fmt.Println(l.Line)
+}
+
+func cmdExec(ctx context.Context, args []string) error {
+	var c common
 	var cmd, cwd string
-	for i := 0; i < len(remaining); i++ {
-		switch remaining[i] {
-		case "--cmd":
-			if i+1 < len(remaining) {
-				cmd = remaining[i+1]
-				i++
-			}
-		case "--cwd":
-			if i+1 < len(remaining) {
-				cwd = remaining[i+1]
-				i++
-			}
+	fs := newFlagSet("exec", &c)
+	fs.StringVar(&cmd, "cmd", "", "command to execute")
+	fs.StringVar(&cwd, "cwd", "", "working directory on the agent")
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	if c.agent == "" || cmd == "" {
+		return errors.New("--agent and --cmd are required")
+	}
+	s, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	pub, err := c.agentKey(ctx, s)
+	if err != nil {
+		return err
+	}
+	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "exec", Command: cmd, Cwd: cwd, Stream: true}, printLine)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return exitError(code)
+	}
+	return nil
+}
+
+func cmdPush(ctx context.Context, args []string) error {
+	var c common
+	var hook, envStr, cwd string
+	fs := newFlagSet("push", &c)
+	fs.StringVar(&hook, "hook", "", "hook script to push")
+	fs.StringVar(&envStr, "env", "", "env vars KEY=val,KEY2=val2")
+	fs.StringVar(&cwd, "cwd", "", "working directory on the agent")
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	if c.agent == "" || hook == "" {
+		return errors.New("--agent and --hook are required")
+	}
+	script, err := os.ReadFile(hook)
+	if err != nil {
+		return fmt.Errorf("read hook file: %w", err)
+	}
+	env := map[string]string{}
+	for _, pair := range strings.Split(envStr, ",") {
+		if k, v, ok := strings.Cut(pair, "="); ok && k != "" {
+			env[k] = v
 		}
 	}
-
-	if flags.relay == "" || flags.token == "" || flags.org == "" || flags.agent == "" || cmd == "" {
-		fmt.Fprintln(os.Stderr, "error: --relay, --token, --org, --agent, and --cmd are required")
-		os.Exit(1)
-	}
-
-	hostname, _ := os.Hostname()
-	conn, err := connectAndAuth(flags, "cli-"+hostname)
+	s, err := c.dial(ctx)
 	if err != nil {
-		log.Fatalf("auth failed: %v", err)
+		return err
 	}
-	defer conn.Close()
-
-	// Send COMMAND
-	payload := map[string]interface{}{
-		"action":  "exec",
-		"command": cmd,
-		"stream":  true,
+	defer s.Close()
+	pub, err := c.agentKey(ctx, s)
+	if err != nil {
+		return err
 	}
-	if cwd != "" {
-		payload["cwd"] = cwd
+	code, err := s.Exec(ctx, c.agent, pub, protocol.CommandRequest{Action: "push_hook", Command: string(script), Env: env, Cwd: cwd, Stream: true}, printLine)
+	if err != nil {
+		return err
 	}
-	cmdPayload, _ := json.Marshal(payload)
+	if code != 0 {
+		return exitError(code)
+	}
+	return nil
+}
 
-	destID := flags.org + "/" + flags.agent
-	var reqID [16]byte
-	frame := protocol.NewFrame(
-		protocol.MsgCommand,
-		reqID,
-		flags.org+"/cli-"+hostname,
-		destID,
-		0,
-		cmdPayload,
-	)
+func cmdPing(ctx context.Context, args []string) error {
+	var c common
+	fs := newFlagSet("ping", &c)
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	if c.agent == "" {
+		return errors.New("--agent is required")
+	}
+	s, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if err := s.Ping(ctx, c.agent); err != nil {
+		return err
+	}
+	fmt.Println("ok")
+	return nil
+}
 
-	if err := conn.Write(protocol.Encode(frame)); err != nil {
-		log.Fatalf("send command: %v", err)
+func cmdAgents(ctx context.Context, args []string) error {
+	var c common
+	fs := newFlagSet("agents", &c)
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	s, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	out, err := s.ListAgents(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+func cmdWhoami(ctx context.Context, args []string) error {
+	var c common
+	fs := newFlagSet("whoami", &c)
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	s, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	fmt.Printf("org: %s\nrelay: %s\n", s.OrgID(), c.relay)
+	return nil
+}
+
+func cmdLogout(args []string) error {
+	var c common
+	fs := newFlagSet("logout", &c)
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	if err := os.Remove(c.configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	fmt.Println("Logged out (local credential removed). Revoke the token in the dashboard to invalidate it everywhere.")
+	return nil
+}
+
+type deviceCodeResp struct {
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+}
+
+type deviceTokenResp struct {
+	Token    string `json:"token"`
+	TokenID  string `json:"token_id"`
+	OrgID    string `json:"org_id"`
+	Name     string `json:"name"`
+	RelayURL string `json:"relay_url"`
+	Error    string `json:"error"`
+}
+
+func postJSON(ctx context.Context, url string, body any, out any) (int, error) {
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "muster-tunnel/"+version)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return resp.StatusCode, err
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return resp.StatusCode, fmt.Errorf("unexpected response (HTTP %d)", resp.StatusCode)
+	}
+	return resp.StatusCode, nil
+}
+
+func cmdLogin(ctx context.Context, args []string) error {
+	var c common
+	var name string
+	fs := newFlagSet("login", &c)
+	fs.StringVar(&name, "name", "", "token name shown in the dashboard (default: muster-cli on <host>)")
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	if err := c.resolve(false); err != nil {
+		return err
+	}
+	urls, err := tunnel.NormalizeRelayURL(c.relay)
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		host, _ := os.Hostname()
+		name = "muster-cli on " + host
 	}
 
-	// Read responses until COMMAND_RESULT or COMMAND_ERROR
-	for {
-		data, err := conn.Read()
+	var dc deviceCodeResp
+	status, err := postJSON(ctx, urls.HTTP+"/api/v1/device/code", map[string]string{"client_name": name}, &dc)
+	if err != nil {
+		return fmt.Errorf("start login: %w", err)
+	}
+	if status != http.StatusOK || dc.DeviceCode == "" {
+		return fmt.Errorf("start login: relay returned HTTP %d", status)
+	}
+
+	fmt.Println("To log in, open this URL in your browser and confirm the code:")
+	fmt.Println()
+	fmt.Printf("  %s\n", dc.VerificationURIComplete)
+	fmt.Println()
+	fmt.Printf("Your code: %s\n", dc.UserCode)
+	fmt.Println()
+	fmt.Println("Waiting for approval...")
+
+	interval := time.Duration(dc.Interval) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+		var tr deviceTokenResp
+		status, err := postJSON(ctx, urls.HTTP+"/api/v1/device/token", map[string]string{"device_code": dc.DeviceCode}, &tr)
 		if err != nil {
-			log.Fatalf("read response: %v", err)
+			continue // transient network error: keep polling
 		}
-
-		respFrame, err := protocol.Decode(data)
-		if err != nil {
-			continue
+		if status == http.StatusOK && tr.Token != "" {
+			cfg := &config.CLIConfig{RelayURL: urls.WS, Token: tr.Token, TokenID: tr.TokenID, OrgID: tr.OrgID, Name: tr.Name}
+			if err := config.SaveCLIConfig(c.configPath, cfg); err != nil {
+				return fmt.Errorf("save credential: %w", err)
+			}
+			fmt.Printf("Logged in to org %s. Token saved to %s\n", tr.OrgID, c.configPath)
+			return nil
 		}
-
-		switch respFrame.MsgType {
-		case protocol.MsgStreamData:
-			var line struct {
-				Line string `json:"line"`
+		switch tr.Error {
+		case "authorization_pending":
+		case "slow_down":
+			interval += 5 * time.Second
+		case "access_denied":
+			return errors.New("login was denied")
+		case "expired_token":
+			return errors.New("login code expired; run 'muster-tunnel login' again")
+		default:
+			if status == http.StatusTooManyRequests {
+				interval += 5 * time.Second
+				continue
 			}
-			json.Unmarshal(respFrame.Payload, &line)
-			fmt.Println(line.Line)
-
-		case protocol.MsgCommandResult:
-			var result struct {
-				ExitCode int `json:"exit_code"`
-			}
-			json.Unmarshal(respFrame.Payload, &result)
-			os.Exit(result.ExitCode)
-
-		case protocol.MsgCommandError:
-			var errResp struct {
-				Message string `json:"message"`
-			}
-			json.Unmarshal(respFrame.Payload, &errResp)
-			fmt.Fprintln(os.Stderr, errResp.Message)
-			os.Exit(1)
-
-		case protocol.MsgError:
-			var errResp struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			}
-			json.Unmarshal(respFrame.Payload, &errResp)
-			fmt.Fprintf(os.Stderr, "%s: %s\n", errResp.Code, errResp.Message)
-			os.Exit(1)
-
-		case protocol.MsgCommandAck:
-			// Command received, waiting for output
+			return fmt.Errorf("login failed (HTTP %d %s)", status, tr.Error)
 		}
 	}
-}
-
-func cmdPush() {
-	flags, remaining := parseCommonFlags(os.Args[2:])
-
-	var hookFile, envStr, cwd string
-	for i := 0; i < len(remaining); i++ {
-		switch remaining[i] {
-		case "--hook":
-			if i+1 < len(remaining) {
-				hookFile = remaining[i+1]
-				i++
-			}
-		case "--env":
-			if i+1 < len(remaining) {
-				envStr = remaining[i+1]
-				i++
-			}
-		case "--cwd":
-			if i+1 < len(remaining) {
-				cwd = remaining[i+1]
-				i++
-			}
-		}
-	}
-
-	if flags.relay == "" || flags.token == "" || flags.org == "" || flags.agent == "" || hookFile == "" {
-		fmt.Fprintln(os.Stderr, "error: --relay, --token, --org, --agent, and --hook are required")
-		os.Exit(1)
-	}
-
-	script, err := os.ReadFile(hookFile)
-	if err != nil {
-		log.Fatalf("read hook file: %v", err)
-	}
-
-	hostname, _ := os.Hostname()
-	conn, err := connectAndAuth(flags, "cli-"+hostname)
-	if err != nil {
-		log.Fatalf("auth failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Build env map from comma-separated string
-	env := make(map[string]string)
-	if envStr != "" {
-		// Simple KEY=val,KEY2=val2 parsing
-		for _, pair := range splitEnv(envStr) {
-			if idx := indexOf(pair, '='); idx > 0 {
-				env[pair[:idx]] = pair[idx+1:]
-			}
-		}
-	}
-
-	pushPayload := map[string]interface{}{
-		"action":  "push_hook",
-		"command": string(script),
-		"env":     env,
-		"stream":  true,
-	}
-	if cwd != "" {
-		pushPayload["cwd"] = cwd
-	}
-	cmdPayload, _ := json.Marshal(pushPayload)
-
-	destID := flags.org + "/" + flags.agent
-	var reqID [16]byte
-	frame := protocol.NewFrame(
-		protocol.MsgCommand,
-		reqID,
-		flags.org+"/cli-"+hostname,
-		destID,
-		0,
-		cmdPayload,
-	)
-
-	if err := conn.Write(protocol.Encode(frame)); err != nil {
-		log.Fatalf("send command: %v", err)
-	}
-
-	// Read responses
-	for {
-		data, err := conn.Read()
-		if err != nil {
-			log.Fatalf("read response: %v", err)
-		}
-
-		respFrame, err := protocol.Decode(data)
-		if err != nil {
-			continue
-		}
-
-		switch respFrame.MsgType {
-		case protocol.MsgStreamData:
-			var line struct {
-				Line string `json:"line"`
-			}
-			json.Unmarshal(respFrame.Payload, &line)
-			fmt.Println(line.Line)
-		case protocol.MsgCommandResult:
-			var result struct {
-				ExitCode int `json:"exit_code"`
-			}
-			json.Unmarshal(respFrame.Payload, &result)
-			os.Exit(result.ExitCode)
-		case protocol.MsgCommandError, protocol.MsgError:
-			var errResp struct {
-				Message string `json:"message"`
-			}
-			json.Unmarshal(respFrame.Payload, &errResp)
-			fmt.Fprintln(os.Stderr, errResp.Message)
-			os.Exit(1)
-		case protocol.MsgCommandAck:
-			// OK
-		}
-	}
-}
-
-func cmdPing() {
-	flags, _ := parseCommonFlags(os.Args[2:])
-
-	if flags.relay == "" || flags.token == "" || flags.org == "" || flags.agent == "" {
-		fmt.Fprintln(os.Stderr, "error: --relay, --token, --org, and --agent are required")
-		os.Exit(1)
-	}
-
-	hostname, _ := os.Hostname()
-	conn, err := connectAndAuth(flags, "cli-"+hostname)
-	if err != nil {
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	// Send a heartbeat to the agent via relay
-	destID := flags.org + "/" + flags.agent
-	var reqID [16]byte
-	frame := protocol.NewFrame(
-		protocol.MsgHeartbeat,
-		reqID,
-		flags.org+"/cli-"+hostname,
-		destID,
-		0,
-		nil,
-	)
-
-	if err := conn.Write(protocol.Encode(frame)); err != nil {
-		os.Exit(1)
-	}
-
-	// Wait for response (HeartbeatAck or Error)
-	data, err := conn.Read()
-	if err != nil {
-		os.Exit(1)
-	}
-
-	respFrame, err := protocol.Decode(data)
-	if err != nil {
-		os.Exit(1)
-	}
-
-	if respFrame.MsgType == protocol.MsgHeartbeatAck {
-		fmt.Println("ok")
-		os.Exit(0)
-	}
-
-	if respFrame.MsgType == protocol.MsgError {
-		var errResp struct {
-			Message string `json:"message"`
-		}
-		json.Unmarshal(respFrame.Payload, &errResp)
-		fmt.Fprintln(os.Stderr, errResp.Message)
-	}
-	os.Exit(1)
-}
-
-func cmdAgents() {
-	flags, _ := parseCommonFlags(os.Args[2:])
-
-	if flags.relay == "" || flags.token == "" || flags.org == "" {
-		fmt.Fprintln(os.Stderr, "error: --relay, --token, and --org are required")
-		os.Exit(1)
-	}
-
-	hostname, _ := os.Hostname()
-	conn, err := connectAndAuth(flags, "cli-"+hostname)
-	if err != nil {
-		log.Fatalf("auth failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Send AGENT_LIST_REQUEST
-	var reqID [16]byte
-	frame := protocol.NewFrame(
-		protocol.MsgAgentListRequest,
-		reqID,
-		flags.org+"/cli-"+hostname,
-		"relay",
-		0,
-		nil,
-	)
-
-	if err := conn.Write(protocol.Encode(frame)); err != nil {
-		log.Fatalf("send request: %v", err)
-	}
-
-	// Read response
-	data, err := conn.Read()
-	if err != nil {
-		log.Fatalf("read response: %v", err)
-	}
-
-	respFrame, err := protocol.Decode(data)
-	if err != nil {
-		log.Fatalf("decode response: %v", err)
-	}
-
-	if respFrame.MsgType == protocol.MsgAgentList {
-		// Print as JSON (muster bash CLI can parse this)
-		fmt.Println(string(respFrame.Payload))
-	} else {
-		fmt.Fprintln(os.Stderr, "unexpected response")
-		os.Exit(1)
-	}
-}
-
-func splitEnv(s string) []string {
-	var result []string
-	current := ""
-	for _, c := range s {
-		if c == ',' {
-			if current != "" {
-				result = append(result, current)
-			}
-			current = ""
-		} else {
-			current += string(c)
-		}
-	}
-	if current != "" {
-		result = append(result, current)
-	}
-	return result
-}
-
-func indexOf(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
+	return errors.New("login code expired; run 'muster-tunnel login' again")
 }
