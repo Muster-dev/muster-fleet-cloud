@@ -51,6 +51,7 @@ const (
 	ErrTimeout         = "E_TIMEOUT"
 	ErrDecrypt         = "E_DECRYPT"
 	ErrAgentBusy       = "E_AGENT_BUSY"
+	ErrBadFrame        = "E_BAD_FRAME"
 )
 
 // MsgTypeName returns a human-readable name for a message type.
