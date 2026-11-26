@@ -4,7 +4,7 @@ Cloud transport addon for [muster](https://github.com/Muster-dev/muster). Run mu
 
 Works with both `muster fleet` (one project, many machines) and `muster group` (many projects, coordinated deploys). Machines on different LANs, behind NATs, or across cloud providers all work through the relay.
 
-This repo contains the **agent** and **tunnel** (client-side binaries). The relay server is hosted separately.
+This repo contains the **agent** and **tunnel** (client-side binaries). The relay server is [muster-cloud](https://github.com/Muster-dev/muster-cloud), hosted at `relay.getmuster.dev`.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ This repo contains the **agent** and **tunnel** (client-side binaries). The rela
 ## Binaries
 
 - **muster-agent** -- Daemon that runs on each remote machine. Maintains a persistent WebSocket connection to the relay, receives commands, executes them locally via muster, and streams output back.
-- **muster-tunnel** -- CLI helper invoked by `muster fleet` and `muster group` on your laptop. Connects to the relay, sends commands (`exec`, `push`, `ping`), and prints streamed output. Also lists connected agents.
+- **muster-tunnel** -- CLI helper invoked by `muster fleet` and `muster group` on your laptop. Logs in with the device flow (`login`), connects to the relay, sends end-to-end encrypted commands (`exec`, `push`, `ping`), and prints streamed output. Also lists connected agents.
 
 ## Install
 
@@ -59,97 +59,80 @@ Supported platforms: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64.
 
 ## Quick Start
 
-### 1. Join an agent
+You need a relay (hosted: `wss://relay.getmuster.dev`, or self-host [muster-cloud](https://github.com/Muster-dev/muster-cloud)) and a join token for your org. Create the token in the dashboard (cloud.getmuster.dev) or via the relay admin API.
 
-On the remote machine:
+### 1. Enroll an agent (on the remote machine)
 
 ```bash
 muster-agent join \
-  --relay wss://relay.example.com:8443 \
-  --token mst_agent_<join-token> \
-  --org myorg \
+  --relay wss://relay.getmuster.dev \
+  --token mst_agent_<one-time-join-token> \
   --name prod-1 \
   --project /opt/myapp
 
 muster-agent run
 ```
 
-### 2. Run a command
+`join` swaps the one-time join token for a long-lived **node credential** (`mst_node_...`). It saves the credential to `~/.muster-agent/config.json` (mode 0600, written atomically) next to the agent's X25519 keypair. `run` and every reconnect use the node credential, and the join token is never needed again. The org comes from the token, so `--org` is optional (it is checked if given).
 
-From your laptop:
+### 2. Log in from your laptop (device flow)
 
 ```bash
-muster-tunnel exec \
-  --relay wss://relay.example.com:8443 \
-  --token mst_cli_<cli-token> \
-  --org myorg \
-  --agent prod-1 \
-  --cmd "muster deploy api"
+muster-tunnel login                 # prints a URL + code; approve it in the dashboard
+muster-tunnel whoami                # org: org_...
 ```
 
-Output streams back in real time.
+The CLI token (`mst_cli_...`) is saved to `~/.muster/cloud.json` (0600). Instead, you can pass `--token`, or set `MUSTER_CLOUD_TOKEN` and `MUSTER_CLOUD_RELAY`.
+
+### 3. Run commands
+
+```bash
+muster-tunnel agents                                   # JSON list of connected agents
+muster-tunnel ping --agent prod-1                      # ok
+muster-tunnel exec --agent prod-1 --cmd "muster deploy api"
+```
+
+Output streams back in real time, and the exit code is the remote command's. On first contact the CLI pins the agent's public key in `~/.muster/cloud_known_agents.json`. If the key ever changes, the CLI refuses to continue unless you pass `--accept-new-key`.
+
+## Security model
+
+- **End-to-end encryption.** Commands, output and results are sealed with NaCl box (X25519 + XSalsa20-Poly1305) between the CLI's per-session key and the agent's key. The relay only sees routing headers. Agents reject unencrypted commands, replayed messages and stale timestamps.
+- **Org isolation.** The relay derives the org from the credential and routes only inside it.
+- **Credentials.** Join tokens are one-time and expire (24 h default). Node credentials can be revoked from the dashboard (`DELETE /api/v1/agents/{name}`). Revocation drops the connection, and the agent exits instead of retrying. All tokens are stored hashed on the relay.
+- **Agent command policy.** `exec` runs **without a shell**. The command must match `allowed_commands` word for word as a prefix (`"muster deploy"` allows `muster deploy api`), and shell metacharacters (`; | & $ \` > <`…) are rejected. `push` (piped hook scripts) only works when the agent is in `push` mode. Set `"allow_shell": true` only if every holder of a CLI token for the org may run arbitrary commands on that machine.
+- **Transport.** The token goes in the first frame, never in a URL or HTTP header. Clients refuse `ws://` to non-local hosts.
 
 ## Configuration
 
-### Agent config (`~/.muster-agent/config.json`)
+### Agent config (`~/.muster-agent/config.json`, or `--config PATH` / `$MUSTER_AGENT_CONFIG`)
 
-Created automatically by `muster-agent join`. See `deploy/agent.json.example` for the full schema.
-
-```json
-{
-  "relay": {
-    "url": "wss://relay.example.com:8443",
-    "token": "mst_agent_..."
-  },
-  "identity": {
-    "org_id": "myorg",
-    "name": "prod-1"
-  },
-  "project": {
-    "dir": "/opt/myapp",
-    "mode": "muster"
-  },
-  "muster_path": "/usr/local/bin/muster",
-  "allowed_commands": [
-    "muster deploy",
-    "muster status",
-    "muster rollback",
-    "muster logs"
-  ],
-  "reconnect_base_delay": "1s",
-  "reconnect_max_delay": "60s"
-}
-```
+Written by `muster-agent join`. See `deploy/agent.json.example`.
 
 | Field | Description |
 |-------|-------------|
-| `relay.url` | Relay WebSocket URL |
-| `relay.token` | Agent authentication token |
-| `identity.org_id` | Organization scope |
-| `identity.name` | Unique agent name within the org |
-| `project.dir` | Working directory for muster commands |
-| `project.mode` | `muster` (run muster locally) or `push` (receive hook scripts) |
-| `allowed_commands` | Whitelist of commands the agent will execute |
-| `reconnect_base_delay` | Initial reconnect delay (exponential backoff) |
-| `reconnect_max_delay` | Maximum reconnect delay |
+| `relay.url` | Relay URL (`wss://relay.getmuster.dev`) |
+| `relay.token` | Node credential (`mst_node_...`), written by `join` |
+| `identity.org_id` / `identity.name` | Assigned by the relay at enrollment |
+| `project.dir` | Default working directory for commands |
+| `project.mode` | `muster` (run allowlisted muster commands) or `push` (also accept hook scripts) |
+| `muster_path` | Path to the muster binary (`muster` in commands maps to this) |
+| `allowed_commands` | Command prefixes the agent will run (argv match, no shell) |
+| `allow_shell` | Run `exec` through `bash -c` with no allowlist (default `false`) |
+| `allow_plaintext` | Accept unencrypted commands from legacy CLIs (default `false`) |
+| `reconnect_base_delay` / `reconnect_max_delay` | Backoff bounds |
 
-### Deploy as systemd service
-
-Copy `deploy/muster-agent.service` to `/etc/systemd/system/`:
+### Deploy as a systemd service
 
 ```bash
-sudo useradd --system --home-dir /var/lib/muster --create-home muster
-sudo mkdir -p /etc/muster
-sudo cp deploy/agent.json.example /etc/muster/agent.json
-# Edit /etc/muster/agent.json with your relay URL, token, etc.
-
-sudo cp deploy/muster-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now muster-agent
-sudo journalctl -u muster-agent -f
+sudo ./deploy/install-agent.sh --binary ./muster-agent \
+  --token mst_agent_<join-token> --name prod-1 --project /opt/myapp
 ```
 
-The service runs as a dedicated `muster` user with systemd security hardening (ProtectSystem, NoNewPrivileges, PrivateTmp).
+This creates a `muster` system user and enrolls the agent as that user, into `/var/lib/muster/agent/config.json`. It then installs `deploy/muster-agent.service` and starts it. Logs: `journalctl -u muster-agent -f`.
+
+### Relay reverse proxy
+
+`deploy/caddy/Caddyfile` and `deploy/nginx/relay.conf` are ready-made configs for `relay.getmuster.dev`. They handle TLS, WebSocket upgrade, passing the real client IP to the relay (with Cloudflare in front), and exposing only the relay's routes.
 
 ## Integration with Muster CLI
 
@@ -211,14 +194,14 @@ Set once in `~/.muster/settings.json`:
 ```json
 {
   "cloud": {
-    "relay": "wss://relay.example.com",
+    "relay": "wss://relay.getmuster.dev",
     "org_id": "myorg",
     "token": "mst_cli_<your-token>"
   }
 }
 ```
 
-Or via CLI: `muster settings --global cloud.relay '"wss://relay.example.com"'`
+Or via CLI: `muster settings --global cloud.relay '"wss://relay.getmuster.dev"'`
 
 ### How the Bash CLI Calls the Tunnel
 
@@ -230,7 +213,9 @@ Or via CLI: `muster settings --global cloud.relay '"wss://relay.example.com"'`
 | `_fleet_cloud_push "$agent" "$hook" "$env"` | `muster-tunnel push --agent <name> --hook <file> --env <vars>` |
 | `_fleet_cloud_check "$agent"` | `muster-tunnel ping --agent <name>` |
 
-Relay URL, token, and org are passed via `--relay`, `--token`, `--org` flags.
+Relay URL, token, and org are passed via `--relay`, `--token`, `--org` flags. All three are optional now: they default to `MUSTER_CLOUD_*` env vars and `~/.muster/cloud.json`, and `--org` is only a check.
+
+> **Note:** agents run `exec` commands without a shell. Compound commands such as `export X=1; muster status --json` are rejected unless the agent sets `allow_shell: true`. Send plain `muster ...` commands with `--cwd` and use `push` mode for scripts.
 
 ## Development
 
@@ -259,51 +244,7 @@ Requires Go 1.24+. Dependencies: `golang.org/x/crypto` (NaCl box, X25519), `gola
 
 ## Protocol
 
-Muster Transport Protocol (MTP) is a binary frame protocol carried over WebSocket.
-
-### Frame layout (89-byte header + variable payload)
-
-```
-Offset  Size  Field
-0       1     Version (0x01)
-1       1     Message type
-2       4     Payload length (big-endian uint32)
-6       16    Request ID (UUID)
-22      32    Source identity (zero-padded)
-54      32    Destination identity (zero-padded)
-86      1     Flags
-87      2     Reserved
-89      N     Payload (JSON or encrypted blob)
-```
-
-### Message types
-
-| Code | Name | Direction |
-|------|------|-----------|
-| 0x01 | AUTH_REQUEST | Client -> Relay |
-| 0x02 | AUTH_RESPONSE | Relay -> Client |
-| 0x03 | AGENT_HELLO | Agent -> Relay |
-| 0x04 | RELAY_ACK | Relay -> Agent |
-| 0x05 | HEARTBEAT | Bidirectional |
-| 0x10 | COMMAND | CLI -> Agent (via relay) |
-| 0x11 | COMMAND_ACK | Agent -> CLI |
-| 0x12 | COMMAND_RESULT | Agent -> CLI |
-| 0x20 | STREAM_DATA | Agent -> CLI |
-| 0x30 | KEY_EXCHANGE | Bidirectional |
-| 0xF0 | ERROR | Relay -> Client |
-
-### Flags
-
-| Bit | Name | Meaning |
-|-----|------|---------|
-| 0x01 | ENCRYPTED | Payload is E2E encrypted |
-| 0x02 | COMPRESSED | Payload is compressed |
-| 0x04 | STREAM_CONTINUED | More stream frames follow |
-| 0x08 | STREAM_END | Final stream frame |
-
-### End-to-end encryption
-
-Agents generate an X25519 key pair at join time. Encrypted payloads use NaCl box (XSalsa20-Poly1305): a 24-byte random nonce is prepended to the ciphertext. The relay routes frames by destination identity but cannot decrypt the payload.
+Muster Transport Protocol (MTP) is a binary frame protocol over WebSocket (89-byte header + payload). The full spec, including authentication, enrollment, routing rules and the encryption format, is in [docs/protocol.md](docs/protocol.md). The relay's HTTP API (device login, tokens, agents) is in [docs/cloud-api.md](docs/cloud-api.md).
 
 ## Shared Packages (`pkg/`)
 
@@ -311,10 +252,10 @@ These packages are exported for use by the relay server and other tools:
 
 | Package | Description |
 |---------|-------------|
-| `pkg/protocol` | MTP frame encoding/decoding, message types, flags |
-| `pkg/tunnel` | WebSocket client, connection management, reconnection logic |
-| `pkg/crypto` | X25519 key pairs, NaCl box encryption/decryption |
-| `pkg/config` | Agent and relay configuration structures |
+| `pkg/protocol` | MTP frames, message types, auth/hello/command payload types, name validation |
+| `pkg/tunnel` | WebSocket transport (size limits, deadlines), relay client, reconnect loop, CLI `Session` (key exchange, encrypted exec) |
+| `pkg/crypto` | X25519 key pairs, NaCl box, `Seal`/`Open` with embedded sender key |
+| `pkg/config` | Agent config, CLI credential file, pinned agent keys, atomic 0600 writes |
 
 ## License
 
