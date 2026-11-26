@@ -74,8 +74,9 @@ func ValidCLIKeyPolicy(p string) bool {
 // DefaultAllowedCommands is the exec allowlist written by `muster-agent
 // join`. Entries match word by word as a prefix of the command's argv
 // ("muster deploy" allows "muster deploy api --force"). Only subcommands
-// that exist in the muster CLI are listed; "muster hooks verify" is the
-// read-only part of "muster hooks" (approve/lock/unlock are not allowed).
+// of the muster CLI are listed (restart and hooks status arrive in muster
+// 0.7); "muster hooks verify" and "muster hooks status" are the read-only
+// parts of "muster hooks" (approve/lock/unlock are not allowed).
 func DefaultAllowedCommands() []string {
 	return []string{
 		"muster deploy",
@@ -85,6 +86,8 @@ func DefaultAllowedCommands() []string {
 		"muster history",
 		"muster --version",
 		"muster hooks verify",
+		"muster hooks status",
+		"muster restart",
 	}
 }
 
