@@ -1,4 +1,4 @@
-# Muster Transport Protocol (MTP) v1.1
+# Muster Transport Protocol (MTP) v1.2
 
 Specification for relay servers and clients in the Muster Fleet Cloud system.
 The HTTP side of the relay (device login, tokens, agents) is specified in
@@ -10,6 +10,13 @@ machines). It authenticates connections, tracks online agents per org, and
 forwards frames within an org. Command payloads are end-to-end encrypted
 between CLI and agent, so the relay cannot read them.
 
+> **v1.2 changes from v1.1** (muster-fleet-cloud v0.3.1, muster-cloud relay
+> with SESSION_INFO support): remote cancel (`COMMAND_CANCEL`), relay → agent
+> session notifications (`SESSION_INFO`, `SESSION_CLOSED`), agent-controlled
+> caller environment, mode discovery in `AGENT_HELLO`/`AGENT_LIST`, and CLI
+> key pinning on agents. All additions are optional fields or new message
+> types, which v1.1 peers ignore; see [Compatibility](#compatibility-v12--v11).
+>
 > **v1.1 changes from v1:** org is derived from the token, header identities
 > are bare names, agents enroll with a join token and receive a node token,
 > the relay stamps SourceID and only routes within an org, and payloads are
@@ -77,10 +84,13 @@ The relay knows each connection's org from its credential.
 | 0x11 | COMMAND_ACK        | Agent → CLI (routed)  | empty                    |
 | 0x12 | COMMAND_RESULT     | Agent → CLI (routed)  | encrypted                |
 | 0x13 | COMMAND_ERROR      | Agent → CLI (routed)  | encrypted, or JSON before decryption |
+| 0x14 | COMMAND_CANCEL     | CLI → Agent (routed)  | empty (v1.2)             |
 | 0x20 | STREAM_DATA        | Agent → CLI (routed)  | encrypted                |
 | 0x21 | STREAM_END         | Agent → CLI (routed)  | empty                    |
 | 0x30 | KEY_EXCHANGE       | CLI → Agent (routed)  | JSON                     |
 | 0x31 | KEY_EXCHANGE_ACK   | Agent → CLI (routed)  | JSON                     |
+| 0x40 | SESSION_INFO       | Relay → Agent         | JSON (v1.2)              |
+| 0x41 | SESSION_CLOSED     | Relay → Agent         | JSON (v1.2)              |
 | 0xF0 | ERROR              | Relay → Client        | JSON                     |
 | 0xF1 | AGENT_LIST         | Relay → CLI           | JSON array               |
 | 0xF2 | AGENT_LIST_REQUEST | CLI → Relay           | empty                    |
@@ -163,20 +173,34 @@ already used".
 After AUTH_RESPONSE an agent sends AGENT_HELLO (also within 5 seconds):
 
 ```json
-{ "agent_name": "prod-1", "version": "0.2.0",
+{ "agent_name": "prod-1", "version": "0.3.1",
   "public_key": "<base64 X25519, 32 bytes>",
-  "hostname": "web-1", "os": "linux", "arch": "amd64" }
+  "hostname": "web-1", "os": "linux", "arch": "amd64",
+  "mode": "muster", "project_dir": true,
+  "allowed_commands": ["muster deploy", "muster status"],
+  "allow_shell": false,
+  "features": ["cancel", "caller-env", "cli-key-pinning"] }
 ```
 
-The relay validates `public_key`, records the metadata on the node, marks
-the agent online and replies RELAY_ACK. A second connection with the same
-identity replaces the first.
+The last five fields are new in v1.2 (older agents omit them):
+
+| Field              | Meaning |
+|--------------------|---------|
+| `mode`             | Project mode, `muster` or `push` (push also accepts `push_hook`) |
+| `project_dir`      | A project directory is configured **and exists**. The path is never sent |
+| `allowed_commands` | The exec allowlist (word-prefix entries, see [Agent command policy](#agent-command-policy)) |
+| `allow_shell`      | `exec` runs through `bash -c` with no allowlist |
+| `features`         | `cancel` (honours COMMAND_CANCEL / SESSION_CLOSED), `caller-env`, `cli-key-pinning` (policy is not `off`) |
+
+The relay validates `public_key`, records the metadata on the node (lists
+are capped at 64 entries of 200 bytes), marks the agent online and replies
+RELAY_ACK. A second connection with the same identity replaces the first.
 
 ### 3. Routing
 
 The relay routes a frame to `DestID` **within the sender's org only**:
 
-- CLI → agent: `COMMAND`, `KEY_EXCHANGE`, `HEARTBEAT`
+- CLI → agent: `COMMAND`, `COMMAND_CANCEL`, `KEY_EXCHANGE`, `HEARTBEAT`
 - agent → CLI: `COMMAND_ACK`, `COMMAND_RESULT`, `COMMAND_ERROR`,
   `STREAM_DATA`, `STREAM_END`, `KEY_EXCHANGE_ACK`, `HEARTBEAT_ACK`
 
@@ -187,6 +211,26 @@ offline destination (including any agent in another org) gets
 Before forwarding, the relay overwrites **SourceID** with the sender's
 authenticated name, so peers can't spoof it. The payload is forwarded
 byte-for-byte.
+
+#### Session notifications (v1.2)
+
+The relay itself (SourceID `"relay"`) tells agents about the CLI connections
+that talk to them. No client can send these types to a peer (`E_BAD_FRAME`),
+and no client can have SourceID `"relay"`, so an agent accepts them only with
+SourceID `"relay"`.
+
+```jsonc
+// SESSION_INFO: sent before the first frame a CLI connection routes to an
+// agent connection (again if the agent reconnects).
+{ "cli": "cli-3f9a1c2e", "token_id": "tok_ab12...", "token_name": "muster-cli on laptop" }
+// SESSION_CLOSED: sent to every agent the CLI talked to when it disconnects.
+{ "cli": "cli-3f9a1c2e" }
+```
+
+`token_id` and `token_name` describe the CLI token the connection
+authenticated with. They come from the relay's store, never from the CLI.
+Frames on one WebSocket are ordered, so SESSION_INFO always arrives before
+that CLI's KEY_EXCHANGE or COMMAND.
 
 ### 4. Heartbeats and idle timeout
 
@@ -201,9 +245,15 @@ HEARTBEAT with DestID set to the agent, which the agent answers.
 org's connected agents:
 
 ```json
-[{"name":"prod-1","org_id":"org_x","version":"0.2.0","hostname":"web-1","os":"linux",
-  "arch":"amd64","connected_at":"…","last_seen":"…","public_key":"<base64>"}]
+[{"name":"prod-1","org_id":"org_x","version":"0.3.1","hostname":"web-1","os":"linux",
+  "arch":"amd64","connected_at":"…","last_seen":"…","public_key":"<base64>",
+  "mode":"muster","project_dir":true,"allowed_commands":["muster deploy"],
+  "features":["cancel","caller-env","cli-key-pinning"]}]
 ```
+
+`mode`, `project_dir`, `allowed_commands`, `allow_shell` and `features`
+appear only for v1.2 agents (`project_dir` is absent, not `false`, for an
+agent that did not report it).
 
 ---
 
@@ -211,8 +261,11 @@ org's connected agents:
 
 - Key agreement **X25519**, authenticated encryption **NaCl box**
   (XSalsa20-Poly1305).
-- Agents have a long-lived keypair (`keys/identity.key`, 0600). Each CLI
-  session generates a fresh ephemeral keypair.
+- Agents have a long-lived keypair (`keys/identity.key`, 0600).
+- v1.2 CLIs also have a long-lived keypair (`~/.muster/cloud_keys/identity.key`,
+  0600, override with `MUSTER_CLOUD_KEY_DIR`), created on first use, which
+  agents pin per CLI token (see [CLI key pinning](#cli-key-pinning-v12)).
+  v1.1 CLIs generate a fresh keypair per session.
 
 ### Encrypted payload format (`FlagEncrypted`)
 
@@ -249,11 +302,12 @@ without session state. The box MAC authenticates it.
 // COMMAND
 { "action": "exec" | "push_hook" | "deploy" | "status" | "rollback" | "logs",
   "command": "muster status", "services": ["api"], "env": {"K":"v"},
-  "cwd": "/abs/path", "stream": true, "ts": 1764180000 }
+  "cwd": "/abs/path", "stream": true, "ts": 1764180000,
+  "persistent_key": true }          // v1.2: sealed with the CLI's long-lived key
 // STREAM_DATA
 { "line": "output text", "stream": "stdout" }
 // COMMAND_RESULT
-{ "exit_code": 0, "status": "done" }
+{ "exit_code": 0, "status": "done" }   // or {"exit_code":130,"status":"cancelled"}
 // COMMAND_ERROR
 { "code": "E_COMMAND_REJECTED", "message": "..." }
 ```
@@ -272,8 +326,108 @@ without session state. The box MAC authenticates it.
 - `deploy/status/rollback/logs`: `muster <action> --json [services]`. Service
   names are validated.
 - `env`: names must be `[A-Za-z_][A-Za-z0-9_]*`. Loader and shell variables
-  (`LD_*`, `DYLD_*`, `PATH`, `BASH_ENV`, `IFS`, …) are refused.
+  (`LD_*`, `DYLD_*`, `PATH`, `BASH_ENV`, `IFS`, …) are refused. The caller
+  variables below are overwritten by the agent, whatever `env` says.
 - `cwd` must be absolute. At most 4 commands run concurrently (`E_AGENT_BUSY`).
+
+**Default allowlist** (`muster-agent join` writes it into new configs;
+existing configs keep their list, edit `allowed_commands` to change it):
+
+| Entry                 | Notes |
+|-----------------------|-------|
+| `muster deploy`       | any arguments (`muster deploy api --force`) |
+| `muster status`       | |
+| `muster rollback`     | |
+| `muster logs`         | streams until stopped. muster has no `--tail` mode yet, so a follow can't be prevented; v1.2 CLIs end it with COMMAND_CANCEL |
+| `muster history`      | read-only |
+| `muster --version`    | read-only |
+| `muster hooks verify` | read-only part of `muster hooks` (`approve`/`lock`/`unlock` stay blocked) |
+
+Matching is word by word on the split argv, as a prefix: `muster hooks
+verify` does not allow `muster hooks approve`, and `muster --version` does
+not allow `muster --versionx`. `muster hooks status` and `muster restart` do
+not exist in the muster CLI, so they are not listed.
+
+### Caller environment (v1.2)
+
+The agent sets these on every command. They override the agent's own
+environment and the request's `env`, so a CLI cannot set them:
+
+| Variable                 | Value |
+|--------------------------|-------|
+| `MUSTER_VIA_AGENT`       | `1` |
+| `MUSTER_CLOUD_CALLER`    | CLI token name from SESSION_INFO (empty if unknown) |
+| `MUSTER_CLOUD_CALLER_ID` | CLI token ID from SESSION_INFO (empty if unknown) |
+| `MUSTER_DEPLOY_SOURCE`   | `cloud:<token name>` (`cloud` if unknown) |
+
+"Unknown" means the relay sent no SESSION_INFO (a v1.1 relay). The values are
+asserted by the relay: the CLI can't spoof them, but a compromised relay
+could. Treat them as an audit label, not as authentication.
+
+### Remote cancel (v1.2)
+
+Each command runs in its own process group with its own context.
+
+1. On SIGINT/SIGTERM, `muster-tunnel exec`/`push` sends `COMMAND_CANCEL` with
+   the COMMAND's RequestID, keeps printing output for up to 5 s, then exits
+   **130**. A second signal exits at once.
+2. The agent looks the command up by (SourceID, RequestID), so one CLI can't
+   cancel another's command. It sends SIGTERM to the whole process group,
+   then SIGKILL after 3 s if anything in the group is left.
+3. It replies `COMMAND_RESULT {"exit_code":130,"status":"cancelled"}`.
+
+When a CLI connection drops without cancelling (killed, network loss), the
+relay sends `SESSION_CLOSED` and the agent cancels every running command of
+that CLI the same way. Commands keep running across *agent*↔relay
+reconnects. A SESSION_CLOSED that happens while the agent itself is offline
+is lost, and that command runs to completion.
+
+Background processes that a successful command leaves behind (e.g. services
+a `bare`/`dev` deploy starts) are not touched. Only a cancel kills the group.
+
+### CLI key pinning (v1.2)
+
+**Threat.** Commands are end-to-end encrypted, but the relay chooses which
+key a session uses. Before v1.2 a malicious or compromised relay could act
+as a CLI towards an agent at any time: generate a keypair, seal a COMMAND to
+the agent's (public) key and route it. The agent had no way to tell a real
+CLI from the relay. The CLI already pins agent keys, so the relay can't read
+or forge traffic of sessions the user starts. Commands the relay *originates*
+were the gap.
+
+**Mitigation.** v1.2 CLIs seal commands with a long-lived identity key and
+set `persistent_key: true`. The agent pins keys per CLI token ID (from
+SESSION_INFO) in `trusted_clis.json` next to its config (0600).
+`cli_key_policy` in the agent config:
+
+| Policy | Behaviour |
+|--------|-----------|
+| `tofu` (default) | A token's first persistent key is pinned. After that, every command under that token must use that key: other keys, and per-session keys, are rejected (`E_COMMAND_REJECTED`, "CLI key ... changed"). Tokens with no pin yet may still use per-session keys (v1.1 CLIs) |
+| `strict` | Only token+key pairs already pinned are accepted (`muster-agent trust add <token-id> <key>`). Commands with no SESSION_INFO (old relay) or plaintext are rejected |
+| `off`    | No checks (v1.1 behaviour) |
+
+`muster-tunnel whoami` prints the CLI's token ID and public key.
+`muster-agent trust list | add <token-id> <key> | reset <token-id>|--all`
+manages pins. The running agent re-reads the file on every command, so a
+reset takes effect immediately. Re-installing a CLI (new key) under the same
+token needs `trust reset` on each agent, or a new token (`muster-tunnel
+login` issues one).
+
+**What remains open.**
+- *First contact (tofu).* The relay can still introduce a token the agent
+  has never seen (it also issues token IDs) and get its key pinned, or use a
+  token before its real owner does. `strict` closes this, at the cost of
+  adding each CLI key to each agent by hand.
+- *Unpinned tokens.* Under `tofu`, a token that has only ever been used by
+  v1.1 CLIs has no pin, so the relay can impersonate it.
+- *Relay-asserted identity.* The token *name* and ID in the caller
+  environment come from the relay.
+- *Cancel/close are not authenticated end to end.* The relay can forge
+  COMMAND_CANCEL or SESSION_CLOSED. It can already drop traffic, so this only
+  adds denial of service.
+- An org-signed CLI certificate (a dashboard-held org key that signs CLI
+  keys at login, verified by agents) would close the first-contact gap
+  without manual steps. It is not implemented.
 
 ---
 
@@ -299,11 +453,16 @@ agent stops instead of retrying, and `muster-agent run` exits 1.
   "identity": { "org_id": "org_x", "name": "prod-1" },
   "project":  { "dir": "/opt/myapp", "mode": "muster" },
   "muster_path": "/usr/local/bin/muster",
-  "allowed_commands": ["muster deploy", "muster status", "muster rollback", "muster logs"],
+  "allowed_commands": ["muster deploy", "muster status", "muster rollback", "muster logs",
+                       "muster history", "muster --version", "muster hooks verify"],
   "allow_shell": false,
-  "allow_plaintext": false
+  "allow_plaintext": false,
+  "cli_key_policy": "tofu"
 }
 ```
+
+`cli_key_policy` is new in v1.2 (`tofu` when absent; `join --cli-key-policy`
+sets it). Pinned CLI keys live in `trusted_clis.json` next to the config.
 
 Written atomically (temp file + fsync + rename) by `muster-agent join`. The
 keypair lives in `keys/` next to the config.
@@ -318,6 +477,22 @@ keypair lives in `keys/` next to the config.
 `muster-tunnel login` writes it via the device flow. Precedence for the
 token: `--token` > `MUSTER_CLOUD_TOKEN` > this file. For the relay:
 `--relay` > `MUSTER_CLOUD_RELAY` > file > `wss://relay.getmuster.dev`.
+
+## Compatibility (v1.2 ↔ v1.1)
+
+Old peers ignore new message types and JSON fields. Unhandled frames are
+logged on v1.1 agents ("unhandled message type").
+
+| Combination | Result |
+|---|---|
+| v1.2 tunnel → v1.1 relay | Works. COMMAND_CANCEL gets `E_BAD_FRAME` from the relay; the tunnel still exits 130, but the command keeps running on the agent |
+| v1.2 tunnel → v1.2 relay → v1.1 agent | Works. The agent ignores COMMAND_CANCEL/SESSION_*: no remote cancel, no caller env, no pinning. Check `features` in `agents` before relying on cancel |
+| v1.1 tunnel → v1.2 relay → v1.2 agent | Works. Ctrl+C just closes the connection → SESSION_CLOSED → the agent stops the command. Per-session keys are accepted while the token has no pin |
+| v1.2 agent ← v1.1 relay | Works. No SESSION_INFO, so caller env says `cloud` with no caller, `tofu` can't pin (no token ID), and `strict` rejects everything |
+| Same token from a v1.2 tunnel, then a v1.1 tunnel (`tofu`) | **Break:** once pinned, the per-session key of the v1.1 tunnel is rejected. Upgrade the tunnel or run `muster-agent trust reset <token-id>` |
+
+Default allowlist changes apply only to configs written by `join` after the
+upgrade.
 
 ## Token prefixes
 

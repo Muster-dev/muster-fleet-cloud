@@ -90,16 +90,19 @@ The CLI token (`mst_cli_...`) is saved to `~/.muster/cloud.json` (0600). Instead
 muster-tunnel agents                                   # JSON list of connected agents
 muster-tunnel ping --agent prod-1                      # ok
 muster-tunnel exec --agent prod-1 --cmd "muster deploy api"
+muster-tunnel exec --agent prod-1 --cmd "muster deploy api" --env RELEASE=v42 --env NOTIFY=1
 ```
 
-Output streams back in real time, and the exit code is the remote command's. On first contact the CLI pins the agent's public key in `~/.muster/cloud_known_agents.json`. If the key ever changes, the CLI refuses to continue unless you pass `--accept-new-key`.
+Output streams back in real time, and the exit code is the remote command's. Ctrl+C (or SIGTERM) asks the agent to stop the command, killing its whole process group, and exits 130. On first contact the CLI pins the agent's public key in `~/.muster/cloud_known_agents.json`. If the key ever changes, the CLI refuses to continue unless you pass `--accept-new-key`.
 
 ## Security model
 
-- **End-to-end encryption.** Commands, output and results are sealed with NaCl box (X25519 + XSalsa20-Poly1305) between the CLI's per-session key and the agent's key. The relay only sees routing headers. Agents reject unencrypted commands, replayed messages and stale timestamps.
+- **End-to-end encryption.** Commands, output and results are sealed with NaCl box (X25519 + XSalsa20-Poly1305) between the CLI's key (`~/.muster/cloud_keys`) and the agent's key. The relay only sees routing headers. Agents reject unencrypted commands, replayed messages and stale timestamps.
 - **Org isolation.** The relay derives the org from the credential and routes only inside it.
 - **Credentials.** Join tokens are one-time and expire (24 h default). Node credentials can be revoked from the dashboard (`DELETE /api/v1/agents/{name}`). Revocation drops the connection, and the agent exits instead of retrying. All tokens are stored hashed on the relay.
 - **Agent command policy.** `exec` runs **without a shell**. The command must match `allowed_commands` word for word as a prefix (`"muster deploy"` allows `muster deploy api`), and shell metacharacters (`; | & $ \` > <`…) are rejected. `push` (piped hook scripts) only works when the agent is in `push` mode. Set `"allow_shell": true` only if every holder of a CLI token for the org may run arbitrary commands on that machine.
+- **CLI key pinning.** Agents pin each CLI token's key on first use (`cli_key_policy: tofu`) and reject a different key for that token afterwards, so the relay can't pose as a CLI that already talked to the agent. `strict` accepts only keys added with `muster-agent trust add`. See [docs/protocol.md](docs/protocol.md#cli-key-pinning-v12) for the remaining first-contact gap.
+- **Caller context.** Every command gets `MUSTER_VIA_AGENT=1`, `MUSTER_CLOUD_CALLER=<CLI token name>` and `MUSTER_DEPLOY_SOURCE=cloud:<token name>`, set by the agent from what the relay reports. `--env` can't override them.
 - **Transport.** The token goes in the first frame, never in a URL or HTTP header. Clients refuse `ws://` to non-local hosts.
 
 ## Configuration
@@ -119,6 +122,7 @@ Written by `muster-agent join`. See `deploy/agent.json.example`.
 | `allowed_commands` | Command prefixes the agent will run (argv match, no shell) |
 | `allow_shell` | Run `exec` through `bash -c` with no allowlist (default `false`) |
 | `allow_plaintext` | Accept unencrypted commands from legacy CLIs (default `false`) |
+| `cli_key_policy` | `tofu` (default), `strict` or `off`. See CLI key pinning |
 | `reconnect_base_delay` / `reconnect_max_delay` | Backoff bounds |
 
 ### Deploy as a systemd service
@@ -210,7 +214,7 @@ Or via CLI: `muster settings --global cloud.relay '"wss://relay.getmuster.dev"'`
 | Bash function | Tunnel command |
 |---|---|
 | `_fleet_cloud_exec "$agent" "$cmd" "$cwd"` | `muster-tunnel exec --agent <name> --cmd <cmd> --cwd <dir>` |
-| `_fleet_cloud_push "$agent" "$hook" "$env"` | `muster-tunnel push --agent <name> --hook <file> --env <vars>` |
+| `_fleet_cloud_push "$agent" "$hook" "$env"` | `muster-tunnel push --agent <name> --hook <file> --env K=V [--env K2=V2 ...]` |
 | `_fleet_cloud_check "$agent"` | `muster-tunnel ping --agent <name>` |
 
 Relay URL, token, and org are passed via `--relay`, `--token`, `--org` flags. All three are optional now: they default to `MUSTER_CLOUD_*` env vars and `~/.muster/cloud.json`, and `--org` is only a check.

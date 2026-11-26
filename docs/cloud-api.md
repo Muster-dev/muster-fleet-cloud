@@ -36,7 +36,8 @@ GET    /api/v1/tokens?org_id=org_x   → 200 [{"id","type","org_id","name","crea
 DELETE /api/v1/tokens/{id}?org_id=org_x → 204  (must belong to org)
 
 ## Agents / nodes (admin)
-GET    /api/v1/agents?org_id=org_x   → 200 [{"name","org_id","connected":bool,"last_seen","version","hostname","os","arch","joined_at"}]
+GET    /api/v1/agents?org_id=org_x   → 200 [{"name","org_id","connected":bool,"last_seen","version","hostname","os","arch","joined_at",
+                                             "mode"?,"project_dir":bool|null,"allowed_commands"?,"allow_shell":bool,"features"?}]
 DELETE /api/v1/agents/{name}?org_id=org_x → 204  (revokes the mst_node_ credential and drops the connection)
 
 ## Agent enrollment
@@ -104,6 +105,12 @@ plus a few strictly additive extensions.
 - `DELETE /tokens/{id}`: a token of another org, a node credential, an admin
   token or an unknown ID all return `404`. Deleting a CLI token also **closes
   live tunnel sessions** authenticated with it.
+- **v1.2:** the relay re-checks live connections against the store every 2 s
+  (`relay.Config.RevocationCheck`). A token revoked by another process on the
+  same data directory (`muster-cloud token revoke <id>`) or one that expired
+  has its sessions closed within that interval, through the same path as
+  `DELETE /tokens/{id}`. The agent then cancels that CLI's running commands
+  (SESSION_CLOSED).
 
 ### Agents
 - `GET /agents` lists every **enrolled** agent of the org (persisted), sorted
@@ -111,6 +118,17 @@ plus a few strictly additive extensions.
   is the last frame time while connected, else the time it last disconnected.
   `version/hostname/os/arch` come from the agent's AGENT_HELLO (empty strings
   until it first connects).
+- **v1.2 additions (mode discovery),** also from AGENT_HELLO, live values while
+  connected, else the last reported ones:
+  - `mode`: `"muster"` or `"push"`. Omitted for agents older than v0.3.1.
+  - `project_dir`: whether a project directory is configured and exists on
+    the machine (`true`/`false`). The path is never sent. `null` for older
+    agents.
+  - `allowed_commands`: the agent's exec allowlist (word-prefix entries).
+    Omitted when empty or unknown.
+  - `allow_shell`: `true` if the agent runs any command through a shell.
+  - `features`: optional protocol features, e.g.
+    `["cancel","caller-env","cli-key-pinning"]`. Omitted for older agents.
 - Agent names are 1–32 chars of `[A-Za-z0-9._-]`, start with an alphanumeric,
   and are unique per org. Joining with a name already enrolled in the org is
   rejected; revoke the old agent first.
@@ -136,3 +154,8 @@ plus a few strictly additive extensions.
   `muster-tunnel` processes never kick each other off.
 - The token is sent only in AUTH_REQUEST, not in an HTTP header, so it can't
   end up in proxy logs.
+- **v1.2:** CLIs may send `COMMAND_CANCEL` (0x14) to agents. The relay sends
+  agents `SESSION_INFO` (0x40, the CLI connection's token ID and name) before
+  the first frame a CLI routes to them and `SESSION_CLOSED` (0x41) when that
+  CLI disconnects. `AGENT_LIST` entries carry the same mode-discovery fields as
+  `GET /agents`. See `docs/protocol.md` → Compatibility.

@@ -16,10 +16,14 @@
     "muster deploy",
     "muster status",
     "muster rollback",
-    "muster logs"
+    "muster logs",
+    "muster history",
+    "muster --version",
+    "muster hooks verify"
   ],
   "allow_shell": false,
   "allow_plaintext": false,
+  "cli_key_policy": "tofu",
   "reconnect_base_delay": "1s",
   "reconnect_max_delay": "60s"
 }
