@@ -168,6 +168,33 @@ A join token presented again is rejected. Before v1.1, agents stored the
 join token and reused it, so every restart or reconnect failed with "token
 already used".
 
+#### Pairing (code + QR → join token), agent ≥ 0.4.0, relay ≥ 0.3.3
+
+`muster-agent pair` gets its join token over HTTPS instead of from the user,
+then enrolls exactly as above. The endpoints are in `docs/cloud-api.md` →
+Machine pairing.
+
+1. `POST /api/v1/pair/start` with the machine's name (optional), hostname,
+   os/arch, agent version and whether a project dir is set. The reply has a
+   `pair_code` (`XXXX-XXXX`, same alphabet as device-login codes), an opaque
+   `device_code`, `verification_uri_complete`, `expires_in` (600) and
+   `interval` (3 s).
+2. The agent prints the code, the URL and (on a TTY, unless `--no-qr`) a QR
+   code of the URL: Unicode half blocks, black on white with explicit SGR
+   colours and a 4-module quiet zone, so it scans on dark and light themes.
+3. It polls `POST /api/v1/pair/token` every `interval`. `slow_down` and HTTP
+   429 add 5 s, network errors and 5xx are retried, and `access_denied`,
+   `expired_token` or passing `expires_in` end the attempt (exit 1, nothing
+   written).
+4. On approval the reply carries a fresh one-time `join_token` bound to the
+   approving org and the (possibly renamed) machine name, valid 15 minutes.
+   The agent connects with it, receives its `mst_node_` credential, and
+   writes the config (0600). The config keeps the relay URL given with
+   `--relay`. The `relay_url` in the reply is informational only.
+
+A relay without these endpoints answers 404. The agent then says so and
+points to `muster-agent join`.
+
 ### 2. Agent Registration
 
 After AUTH_RESPONSE an agent sends AGENT_HELLO (also within 5 seconds):
@@ -464,8 +491,22 @@ agent stops instead of retrying, and `muster-agent run` exits 1.
 `cli_key_policy` is new in v1.2 (`tofu` when absent; `join --cli-key-policy`
 sets it). Pinned CLI keys live in `trusted_clis.json` next to the config.
 
-Written atomically (temp file + fsync + rename) by `muster-agent join`. The
-keypair lives in `keys/` next to the config.
+Written atomically (temp file + fsync + rename) by `muster-agent pair` or
+`join`. The keypair lives in `keys/` next to the config.
+
+### Agent state (`agent-state.json` next to the config, mode 0644)
+
+```json
+{ "connected": true, "name": "prod-1", "org_id": "org_x", "relay": "wss://relay.getmuster.dev",
+  "pid": 4242, "connected_since": "2026-11-26T22:03:59Z", "updated_at": "2026-11-26T22:05:29Z" }
+```
+
+`muster-agent run` writes this file after each registration, on every
+HEARTBEAT_ACK (every 30 s) and on disconnect. It holds no secrets.
+`muster-agent status --connected` exits 0 only if `connected` is true and
+`updated_at` is under 90 s old, 3 otherwise, and 1 if there is no config.
+Other processes can tell whether the agent is online this way without
+opening a second connection (that would replace the daemon's).
 
 ## CLI credential (`~/.muster/cloud.json`, mode 0600)
 

@@ -59,9 +59,34 @@ Supported platforms: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64.
 
 ## Quick Start
 
-You need a relay (hosted: `wss://relay.getmuster.dev`, or self-host [muster-cloud](https://github.com/Muster-dev/muster-cloud)) and a join token for your org. Create the token in the dashboard (cloud.getmuster.dev) or via the relay admin API.
+You need a relay: the hosted one at `wss://relay.getmuster.dev` (the default), or your own [muster-cloud](https://github.com/Muster-dev/muster-cloud).
 
-### 1. Enroll an agent (on the remote machine)
+### 1. Connect a machine (on the server)
+
+The easy way: run one command and approve the code. You don't copy any tokens.
+
+```bash
+muster cloud connect                 # muster CLI: installs muster-agent if needed, then pairs
+# or directly:
+muster-agent pair --name prod-1 --project /opt/myapp
+```
+
+`pair` prints a code, the approval URL and a QR code of that URL. Scan it with your phone or open the URL, sign in to Fleet Cloud, check the code and machine details, and approve (you can rename the machine there). The agent then enrolls on its own and saves its credential. Options: `--mode muster|push`, `--relay URL`, `--no-qr`, `--config PATH`. The QR code is hidden when stdout isn't a terminal. A denied or expired code exits 1 and changes nothing.
+
+Then keep it running:
+
+```bash
+sudo muster-agent install-service    # systemd unit (Linux) / LaunchDaemon (macOS), runs as you
+muster-agent install-service --user  # or per-user (systemctl --user / LaunchAgent), no sudo
+muster-agent install-service --print # just show the unit/plist and where it would go
+muster-agent status --connected      # exit 0 once the running agent is online (3 if not)
+```
+
+`install-service` is safe to re-run: it rewrites the unit only when it changed and leaves an unchanged, running service alone. On Linux, `--user` services stop at logout unless you run `sudo loginctl enable-linger $USER` (it tells you).
+
+#### Advanced: join tokens
+
+For automation (cloud-init, Ansible) create a one-time join token in the dashboard or with the relay admin API (`POST /api/v1/tokens`), then:
 
 ```bash
 muster-agent join \
@@ -73,7 +98,7 @@ muster-agent join \
 muster-agent run
 ```
 
-`join` swaps the one-time join token for a long-lived **node credential** (`mst_node_...`). It saves the credential to `~/.muster-agent/config.json` (mode 0600, written atomically) next to the agent's X25519 keypair. `run` and every reconnect use the node credential, and the join token is never needed again. The org comes from the token, so `--org` is optional (it is checked if given).
+Both `pair` and `join` end the same way: the one-time join token is swapped for a long-lived **node credential** (`mst_node_...`). It's saved to `~/.muster-agent/config.json` (mode 0600, written atomically) next to the agent's X25519 keypair. `run` and every reconnect use the node credential, and the join token is never needed again. With `join`, the org comes from the token, so `--org` is optional (it is checked if given).
 
 ### 2. Log in from your laptop (device flow)
 
@@ -109,12 +134,12 @@ Output streams back in real time, and the exit code is the remote command's. Ctr
 
 ### Agent config (`~/.muster-agent/config.json`, or `--config PATH` / `$MUSTER_AGENT_CONFIG`)
 
-Written by `muster-agent join`. See `deploy/agent.json.example`.
+Written by `muster-agent pair` or `join`. See `deploy/agent.json.example`.
 
 | Field | Description |
 |-------|-------------|
 | `relay.url` | Relay URL (`wss://relay.getmuster.dev`) |
-| `relay.token` | Node credential (`mst_node_...`), written by `join` |
+| `relay.token` | Node credential (`mst_node_...`), written by `pair` / `join` |
 | `identity.org_id` / `identity.name` | Assigned by the relay at enrollment |
 | `project.dir` | Default working directory for commands |
 | `project.mode` | `muster` (run allowlisted muster commands) or `push` (also accept hook scripts) |
@@ -125,7 +150,11 @@ Written by `muster-agent join`. See `deploy/agent.json.example`.
 | `cli_key_policy` | `tofu` (default), `strict` or `off`. See CLI key pinning |
 | `reconnect_base_delay` / `reconnect_max_delay` | Backoff bounds |
 
+A running agent also writes `agent-state.json` next to the config (connected or not, since when, last heartbeat; no secrets). `muster-agent status --connected` reads it.
+
 ### Deploy as a systemd service
+
+`muster-agent install-service` (see Quick Start) is the simple path: it runs the agent as the user who paired it. For a hardened setup with a dedicated `muster` system user:
 
 ```bash
 sudo ./deploy/install-agent.sh --binary ./muster-agent \

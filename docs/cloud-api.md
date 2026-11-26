@@ -30,7 +30,22 @@ GET  /api/v1/device/{user_code}            (admin)  200 {"user_code","client_nam
 POST /api/v1/device/{user_code}/approve    (admin)  body {"org_id":"org_x","user_id":"user_x"}  → 200 {"status":"approved"}
 POST /api/v1/device/{user_code}/deny       (admin)  → 200 {"status":"denied"}
 
+## Machine pairing (code + QR) — public endpoints are rate limited per IP (relay ≥ 0.3.3, agent ≥ 0.4.0)
+POST /api/v1/pair/start         body {"name":"prod-1"?,"hostname":"ip-10-0-0-5","os":"linux","arch":"amd64","project_dir_set":true,"agent_version":"0.4.0"}
+  200 {"pair_code":"KX7M-42QP","device_code":"<opaque 32B>","verification_uri":"https://cloud.getmuster.dev/pair",
+       "verification_uri_complete":"https://cloud.getmuster.dev/pair?code=KX7M-42QP","expires_in":600,"interval":3}
+  pair_code: same alphabet and XXXX-XXXX format as device-login user codes, separate namespace.
+POST /api/v1/pair/token         body {"device_code":"..."}
+  400 {"error":"authorization_pending"} | 400 {"error":"slow_down"} | 400 {"error":"expired_token"} | 400 {"error":"access_denied"}
+  200 {"join_token":"mst_agent_...","org_id":"org_x","name":"prod-1","relay_url":"wss://relay.getmuster.dev"}
+  Redeemed exactly once. The join token is one-time, bound to org_id + name, and expires after 15 minutes.
+GET  /api/v1/pair/{code}             (admin)  200 {"pair_code","name","hostname","os","arch","agent_version","project_dir_set",
+                                                   "requested_from","status":"pending|approved|denied|expired","created_at","expires_at"} | 404
+POST /api/v1/pair/{code}/approve     (admin)  body {"org_id":"org_x","user_id":"user_x","name":"prod-web"?}  → 200 {"status":"approved","name":"prod-web"}
+POST /api/v1/pair/{code}/deny        (admin)  → 200 {"status":"denied"}
+
 ## Tokens (admin)
+POST   /api/v1/tokens/introspect   body {"token":"mst_cli_..."}  → 200 {"active":true,"token_id","org_id","name","type":"cli"} | 200 {"active":false}
 POST   /api/v1/tokens        body {"type":"cli|agent-join","org_id":"org_x","name":"prod-1","expires_in":86400?}  → 201 {"token":"mst_...","id":"...","type","org_id","name","created_at","expires_at"}
 GET    /api/v1/tokens?org_id=org_x   → 200 [{"id","type","org_id","name","created_at","expires_at","last_used_at","used"}]  (never hashes or raw tokens)
 DELETE /api/v1/tokens/{id}?org_id=org_x → 204  (must belong to org)
@@ -59,6 +74,9 @@ plus a few strictly additive extensions.
 - Admin auth is **only** `Authorization: Bearer mst_admin_...`. Missing or
   invalid → `401 {"error":"admin token required"}`. Too many failed admin or
   WebSocket auths from one IP → `429` until the bucket refills (default 10/min).
+- Every admin request, including introspection, also counts against a per-IP
+  admin rate limit (default 600/min, `--rate-admin`). Over it →
+  `429 {"error":"rate limited"}` with `Retry-After`.
 - Admin tokens are **global** (not org-scoped). They can only be created with
   the relay CLI (`muster-cloud token create --type admin`), never through the API.
 - All error bodies are `{"error":"<message>"}`. Request bodies are JSON, max
@@ -89,6 +107,52 @@ plus a few strictly additive extensions.
   `404`. Approve requires a valid `org_id`. `user_id` is optional, ≤128 chars.
 - Device sessions are kept in memory (10 min TTL, max 10 000 pending). A relay
   restart cancels pending logins; the CLI just runs `login` again.
+
+### Machine pairing
+- The flow: `muster-agent pair` → `POST /pair/start` → the user opens
+  `verification_uri_complete` (the agent shows it as a QR code too) → the
+  dashboard looks the code up with `GET /pair/{code}` and calls `approve`
+  or `deny` → the agent's next `POST /pair/token` gets a join token → the
+  agent enrolls over the WebSocket like any join token.
+- Built on the device-login machinery in a separate store: same 10-minute
+  TTL, max 10 000 pending, in-memory only (a relay restart cancels pending
+  pairings), `slow_down` below ~80% of `interval` (+5 s), and exactly-once
+  redemption. A denied session returns `access_denied` once and is then
+  forgotten. Default `interval` is 3 s (`--pair-interval`).
+- Rate limit: separate per-IP bucket for both public pairing endpoints,
+  default 60/min (`--rate-pair`), `429 {"error":"rate limited"}` with
+  `Retry-After`.
+- `POST /pair/start`: unknown fields are **ignored** here (unlike everywhere
+  else), so newer agents can send more without being rejected. `name` is
+  optional and defaults to the sanitized `hostname`, and the result must be
+  a valid agent name (1–32 chars of `[A-Za-z0-9._-]`) or the request gets
+  `400`. `hostname` ≤ 253, `os`/`arch` ≤ 32, `agent_version` ≤ 64 printable
+  chars, all optional. `verification_uri` is `<--dashboard-url>/pair`.
+- `requested_from` is the client IP that called `/pair/start` (the
+  `--client-ip-header` value when the request came through the local
+  reverse proxy). Show it so users can spot a code they didn't request.
+- `approve`: `org_id` is required, `user_id` is optional (≤ 128), and `name`
+  optionally renames the machine (valid agent name, else `400`). If an agent
+  with that name is already enrolled in the org →
+  `409 {"error":"an agent with this name is already enrolled in the org"}`
+  and the session stays pending (pick another name, or revoke the old
+  agent). Approve/deny on a non-pending session → `409`, unknown code →
+  `404`. The code is case-insensitive and the dash is optional.
+- The join token is minted when the agent redeems the approval, not at
+  approval time. The relay never holds a raw token in memory, and an
+  approval nobody picks up leaves no credential behind. It appears in
+  `GET /tokens` as an `agent-join` token named after the machine
+  (`created_by` = the approving `user_id`) and shows `used: true` once the
+  agent has enrolled.
+
+### Token introspection
+- `POST /tokens/introspect` (admin) is for trusted servers (the Muster
+  Assistant API) that receive a user's CLI token. `active: true` only for an
+  existing, unexpired **CLI** token. Unknown, expired, revoked, join, node
+  and admin tokens, and empty or over-long (> 256 chars) values, all return
+  `{"active":false}`. A malformed body or unknown fields → `400`.
+- The lookup compares the hash against every stored token in constant
+  time. The token is never logged and `last_used_at` is not updated.
 
 ### Tokens
 - `POST /tokens`: `type` is `cli` or `agent-join` (anything else → `400`). `name`
