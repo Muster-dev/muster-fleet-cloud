@@ -50,6 +50,54 @@ type AgentHello struct {
 	Hostname  string `json:"hostname,omitempty"`
 	OS        string `json:"os,omitempty"`
 	Arch      string `json:"arch,omitempty"`
+
+	// Fields added in v1.2 (all optional; older relays ignore them).
+
+	// Mode is the agent's project mode: "muster" or "push".
+	Mode string `json:"mode,omitempty"`
+	// ProjectDir reports whether a project directory is configured and
+	// exists on the machine. The path itself is never sent.
+	ProjectDir bool `json:"project_dir"`
+	// AllowedCommands is the agent's exec allowlist (word-prefix entries).
+	AllowedCommands []string `json:"allowed_commands,omitempty"`
+	// AllowShell is true when the agent runs exec commands through a shell
+	// without an allowlist.
+	AllowShell bool `json:"allow_shell,omitempty"`
+	// Features lists optional protocol features the agent supports
+	// (FeatureCancel, FeatureCallerEnv, ...), so clients can tell a v1.2
+	// agent from an older one.
+	Features []string `json:"features,omitempty"`
+}
+
+// Optional agent features advertised in AgentHello.Features.
+const (
+	// FeatureCancel: the agent honours COMMAND_CANCEL and SESSION_CLOSED.
+	FeatureCancel = "cancel"
+	// FeatureCallerEnv: the agent sets MUSTER_VIA_AGENT / MUSTER_CLOUD_CALLER
+	// / MUSTER_DEPLOY_SOURCE on every command.
+	FeatureCallerEnv = "caller-env"
+	// FeatureCLIKeyPinning: the agent pins CLI identity keys per token.
+	FeatureCLIKeyPinning = "cli-key-pinning"
+)
+
+// SessionInfo is the JSON payload of a SESSION_INFO frame (relay -> agent).
+// The relay sends it before the first frame it routes from a CLI connection
+// to an agent, so the agent learns which credential that connection
+// authenticated with. It comes from the relay, never from the CLI.
+type SessionInfo struct {
+	// CLI is the relay-assigned connection name (the SourceID of the CLI's
+	// frames).
+	CLI string `json:"cli"`
+	// TokenID and TokenName identify the CLI token the connection
+	// authenticated with.
+	TokenID   string `json:"token_id"`
+	TokenName string `json:"token_name,omitempty"`
+}
+
+// SessionClosed is the JSON payload of a SESSION_CLOSED frame (relay ->
+// agent): the CLI connection is gone, so its commands should be stopped.
+type SessionClosed struct {
+	CLI string `json:"cli"`
 }
 
 // ErrorPayload is the JSON payload of ERROR and COMMAND_ERROR frames.

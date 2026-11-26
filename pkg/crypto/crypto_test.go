@@ -2,6 +2,8 @@ package crypto
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -140,5 +142,39 @@ func TestSaveLoadKeyPairRoundTrip(t *testing.T) {
 	}
 	if loaded.PrivateKey != original.PrivateKey {
 		t.Error("loaded private key does not match original")
+	}
+}
+
+func TestLoadOrCreateKeyPairConcurrent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cloud_keys")
+	const n = 8
+	keys := make(chan *KeyPair, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			kp, err := LoadOrCreateKeyPair(dir)
+			if err != nil {
+				t.Error(err)
+			}
+			keys <- kp
+		}()
+	}
+	var first *KeyPair
+	for i := 0; i < n; i++ {
+		kp := <-keys
+		if kp == nil {
+			continue
+		}
+		if first == nil {
+			first = kp
+		} else if kp.PublicKey != first.PublicKey {
+			t.Fatal("parallel first runs produced different identities")
+		}
+	}
+	again, err := LoadOrCreateKeyPair(dir)
+	if err != nil || again.PublicKey != first.PublicKey {
+		t.Fatalf("reload: %v", err)
+	}
+	if st, err := os.Stat(filepath.Join(dir, "identity.key")); err != nil || st.Mode().Perm() != 0600 {
+		t.Fatalf("key file: %v %v", st, err)
 	}
 }

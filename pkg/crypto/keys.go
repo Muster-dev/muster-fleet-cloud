@@ -108,3 +108,38 @@ func LoadKeyPair(dir string) (*KeyPair, error) {
 	copy(kp.PublicKey[:], pubBytes)
 	return kp, nil
 }
+
+// LoadOrCreateKeyPair loads the keypair in dir, or generates and saves one if
+// none exists. Creation is race-safe across processes: the keys are written
+// to a temporary sibling directory that is renamed into place, and a process
+// that loses the race loads the winner's keys, so parallel first runs agree
+// on one identity.
+func LoadOrCreateKeyPair(dir string) (*KeyPair, error) {
+	if kp, err := LoadKeyPair(dir); err == nil {
+		return kp, nil
+	}
+	kp, err := GenerateKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(dir)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return nil, fmt.Errorf("create key directory: %w", err)
+	}
+	tmp, err := os.MkdirTemp(parent, "."+filepath.Base(dir)+".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("create key directory: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	if err := SaveKeyPair(tmp, kp); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		// Someone else created it first (or it exists with other content).
+		if existing, lerr := LoadKeyPair(dir); lerr == nil {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("save key pair: %w", err)
+	}
+	return kp, nil
+}
