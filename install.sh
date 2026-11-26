@@ -9,20 +9,21 @@ BASE_URL="https://github.com/${REPO}/releases/download"
 die() { printf '%b\n' "Error: $1" >&2; exit 1; }
 info() { printf '%b\n' "$1"; }
 
-VERSION=""; PREFIX=""; INSTALL_AGENT=0; INSTALL_TUNNEL=0; INSTALL_RELAY=0
+VERSION=""; PREFIX=""; INSTALL_AGENT=0; INSTALL_TUNNEL=0; INSTALL_RELAY=0; ASSUME_YES="${MUSTER_YES:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --agent)   INSTALL_AGENT=1; shift ;;
     --tunnel)  INSTALL_TUNNEL=1; shift ;;
-    --relay)   INSTALL_RELAY=1; shift ;;
+    --relay)   die "The relay is no longer distributed here. See https://getmuster.dev/fleet-cloud for self-hosting." ;;
+    -y|--yes)  ASSUME_YES=1; shift ;;
     --all)     INSTALL_AGENT=1; INSTALL_TUNNEL=1; shift ;;
     --version) VERSION="$2"; shift 2 ;;
     --prefix)  PREFIX="$2"; shift 2 ;;
     -h|--help)
-      info "Usage: install.sh [--agent] [--tunnel] [--relay] [--all] [--version VER] [--prefix DIR]"
+      info "Usage: install.sh [--agent] [--tunnel] [--all] [--yes] [--version VER] [--prefix DIR]"
       info ""; info "  --agent     Install muster-agent only"
       info "  --tunnel    Install muster-tunnel only"
-      info "  --relay     Install muster-cloud relay server"
+      info "  --yes, -y   Don't ask for confirmation (also MUSTER_YES=1)"
       info "  --all       Install agent + tunnel (default)"
       info "  --version   Pin to a specific version (default: latest)"
       info "  --prefix    Install directory (default: ~/.local/bin)"; exit 0 ;;
@@ -56,10 +57,13 @@ fi
 info "Installing muster-fleet-cloud v${VERSION} (${OS}/${ARCH})"
 
 # --- preview + confirm -----------------------------------------------------
+# Ask for confirmation only when a terminal can actually be opened.
+# (curl | bash: stdin is the script, so read from /dev/tty — but /dev/tty
+# exists even in CI/cloud-init where opening it fails.)
 _interactive=false
-[ -t 0 ] && _interactive=true
-# curl | bash: stdin is the script, but /dev/tty is the terminal
-[ -e /dev/tty ] && _interactive=true
+if [ -z "$ASSUME_YES" ] && { : </dev/tty; } 2>/dev/null; then
+  _interactive=true
+fi
 
 info ""
 info "  This will install:"
