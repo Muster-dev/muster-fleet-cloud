@@ -23,6 +23,8 @@ test:
 PLATFORMS = linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 # Cross-compilation targets
+dist: export CGO_ENABLED=0
+dist: export GOAMD64=v1
 dist:
 	@mkdir -p dist
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/muster-agent-linux-amd64 ./cmd/muster-agent

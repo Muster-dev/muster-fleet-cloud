@@ -20,6 +20,11 @@ jobs:
       - name: Build all platforms
         run: make dist VERSION=${{ github.ref_name }}
 
+      - name: Check Linux binaries are static and run
+        run: |
+          for f in dist/*-linux-*; do file "$f" | grep -q "statically linked" || { echo "$f is not static"; exit 1; }; done
+          ./dist/muster-agent-linux-amd64 version
+
       - name: Generate checksums
         run: cd dist && sha256sum * > checksums.txt
 
